@@ -21,9 +21,17 @@ pub fn download_models(directory: &Path, endpoint: &str, force: bool) -> Result<
     fs::create_dir_all(directory)
         .with_context(|| format!("创建模型目录失败：{}", directory.display()))?;
     let endpoint = endpoint.trim_end_matches('/');
+    let self_contained = is_self_contained_model(directory);
 
     for (remote, name) in FILES {
         let destination = directory.join(name);
+        if name == "model.onnx_data" && self_contained && !force {
+            println!(
+                "已有单文件 model.onnx，跳过外置权重：{}",
+                destination.display()
+            );
+            continue;
+        }
         if destination.exists() && !force {
             println!(
                 "已存在，跳过：{}（使用 --force 覆盖）",
@@ -40,6 +48,13 @@ pub fn download_models(directory: &Path, endpoint: &str, force: bool) -> Result<
     println!("模型文件已就绪：{}", directory.display());
     println!("验证：diffract.exe --require-semantic --check 旧版.docx 新版.docx");
     Ok(())
+}
+
+/// 便携包里的老模型是单个大文件；这种情况下不需要再下载外置权重。
+fn is_self_contained_model(directory: &Path) -> bool {
+    fs::metadata(directory.join("model.onnx"))
+        .map(|metadata| metadata.len() > 1024 * 1024)
+        .unwrap_or(false)
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<()> {
@@ -164,5 +179,22 @@ mod tests {
     fn formats_small_and_large_progress_sizes() {
         assert_eq!(format_bytes(41_689), "40.7 KB");
         assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[test]
+    fn detects_self_contained_model() {
+        let directory =
+            std::env::temp_dir().join(format!("diffract-model-test-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let model = directory.join("model.onnx");
+        let file = File::create(&model).unwrap();
+        file.set_len(2 * 1024 * 1024).unwrap();
+        assert!(is_self_contained_model(&directory));
+
+        file.set_len(41_689).unwrap();
+        assert!(!is_self_contained_model(&directory));
+
+        drop(file);
+        let _ = fs::remove_dir_all(&directory);
     }
 }
