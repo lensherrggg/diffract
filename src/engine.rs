@@ -91,6 +91,13 @@ pub fn compare_files(
             let old_text = record.old_text.as_deref().unwrap_or("");
             let new_text = record.new_text.as_deref().unwrap_or("");
             record.diff = Some(para_diff(old_text, new_text));
+            if let Some(cells) = record.row_diff.as_mut() {
+                for cell in cells {
+                    if let (Some(old), Some(new)) = (cell.old.as_deref(), cell.new.as_deref()) {
+                        cell.diff = Some(para_diff(old, new));
+                    }
+                }
+            }
             if modified_count > 20 && index % 20 == 0 {
                 progress(Progress::Step {
                     label: "段内 diff".to_string(),

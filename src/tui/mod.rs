@@ -1026,6 +1026,9 @@ fn comparison_lines(
 ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     match record.status {
         Status::Modified | Status::SuspectedModified => {
+            if let Some(lines) = cell_comparison_lines(record, expanded, context_chars) {
+                return lines;
+            }
             let Some(diff) = &record.diff else {
                 return (
                     plain_lines(record.old_text.as_deref(), Color::Reset),
@@ -1057,6 +1060,107 @@ fn comparison_lines(
             plain_lines(record.new_text.as_deref(), Color::Reset),
         ),
     }
+}
+
+fn cell_comparison_lines(
+    record: &Record,
+    expanded: bool,
+    context_chars: usize,
+) -> Option<(Vec<Line<'static>>, Vec<Line<'static>>)> {
+    let cells = record.row_diff.as_ref()?;
+    if cells.is_empty() {
+        return None;
+    }
+    let mut old_lines = vec![Line::from(Span::styled(
+        "仅显示有变化的单元格",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    let mut new_lines = old_lines.clone();
+    for cell in cells {
+        let old_diff = cell.diff.as_ref().map(|diff| diff.old.as_slice());
+        let new_diff = cell.diff.as_ref().map(|diff| diff.new.as_slice());
+        old_lines.extend(cell_side_lines(
+            &cell.column,
+            cell.old.as_deref(),
+            old_diff,
+            Color::Red,
+            expanded,
+            context_chars,
+        ));
+        new_lines.extend(cell_side_lines(
+            &cell.column,
+            cell.new.as_deref(),
+            new_diff,
+            Color::Green,
+            expanded,
+            context_chars,
+        ));
+    }
+    Some((old_lines, new_lines))
+}
+
+fn cell_side_lines(
+    column: &str,
+    value: Option<&str>,
+    spans: Option<&[DiffSpan]>,
+    color: Color,
+    expanded: bool,
+    context_chars: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut current = Line::from(vec![Span::styled(
+        format!("{column}："),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    match spans {
+        Some(spans) => {
+            let spans = if expanded {
+                spans.to_vec()
+            } else {
+                excerpt(spans, context_chars)
+            };
+            for span in spans {
+                let style = match span.op {
+                    DiffOp::Equal => Style::default(),
+                    DiffOp::Delete => Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                    DiffOp::Insert => Style::default().fg(Color::Green),
+                };
+                for (index, part) in span.text.split('\n').enumerate() {
+                    if index > 0 {
+                        lines.push(current);
+                        current = Line::from("");
+                    }
+                    if !part.is_empty() {
+                        current.spans.push(Span::styled(part.to_string(), style));
+                    }
+                }
+            }
+        }
+        None => match value {
+            Some(value) => {
+                for (index, part) in value.split('\n').enumerate() {
+                    if index > 0 {
+                        lines.push(current);
+                        current = Line::from("");
+                    }
+                    if !part.is_empty() {
+                        current
+                            .spans
+                            .push(Span::styled(part.to_string(), Style::default().fg(color)));
+                    }
+                }
+            }
+            None => current
+                .spans
+                .push(Span::styled("（无）", Style::default().fg(Color::DarkGray))),
+        },
+    }
+    lines.push(current);
+    lines
 }
 
 fn draw_detail_panel(

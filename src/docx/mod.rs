@@ -24,7 +24,6 @@ pub struct TableRow {
     pub cells: Vec<String>,
     /// 展示用的一行文本：单元格以 " | " 连接。
     pub text: String,
-    pub normalized: String,
     /// 首列归一化文本，非空时作为行主键。
     pub key: Option<String>,
 }
@@ -96,7 +95,6 @@ pub fn parse(path: &Path) -> Result<Document> {
             if text.trim().is_empty() {
                 continue;
             }
-            let normalized = normalize_for_match(&text);
             let key = cells
                 .first()
                 .map(|cell| normalize_for_match(cell))
@@ -105,7 +103,6 @@ pub fn parse(path: &Path) -> Result<Document> {
                 index: rows.len(),
                 cells,
                 text,
-                normalized,
                 key,
             });
         }

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Local;
 
-use crate::result::{CompareOutput, DiffOp, Record, SemanticStatus, Status, Summary};
+use crate::result::{
+    CellChange, CompareOutput, DiffOp, DiffSpan, Record, SemanticStatus, Status, Summary,
+};
 
 pub fn default_export_path(extension: &str) -> PathBuf {
     let stamp = Local::now().format("%Y%m%d-%H%M%S");
@@ -134,6 +136,12 @@ del{background:#fee2e2;color:#991b1b;text-decoration:line-through}
 ins{background:#d1fae5;color:#065f46;text-decoration:none}
 .empty{color:#94a3b8}
 .note{font-size:12px;color:#7c3aed}
+table.cells{border-collapse:collapse;width:100%;margin:6px 0;font-size:13px}
+table.cells th,table.cells td{border:1px solid #e2e8f0;padding:6px 8px;vertical-align:top;text-align:left}
+table.cells th{background:#f1f5f9;color:#475569;font-weight:600}
+table.cells td.col{width:18%;color:#334155;font-weight:600;background:#f8fafc}
+table.cells td.old{background:#fff1f2}
+table.cells td.new{background:#ecfdf5}
 </style>
 </head>
 <body>
@@ -247,7 +255,9 @@ fn render_record_html(html: &mut String, record: &Record) {
 
     match record.status {
         Status::Modified | Status::SuspectedModified => {
-            if let Some(diff) = &record.diff {
+            if let Some(cells) = record.row_diff.as_deref().filter(|cells| !cells.is_empty()) {
+                render_cell_changes_html(html, cells);
+            } else if let Some(diff) = &record.diff {
                 render_diff_html(html, "旧文（删除线为旧内容）", &diff.old);
                 render_diff_html(html, "新文（绿色为新增内容）", &diff.new);
             }
@@ -292,6 +302,56 @@ fn render_diff_html(html: &mut String, label: &str, spans: &[crate::result::Diff
         }
     }
     html.push_str("</div>\n");
+}
+
+fn render_cell_changes_html(html: &mut String, cells: &[CellChange]) {
+    html.push_str("<div class=\"label\">单元格差异（仅列出有变化的单元格）</div>\n");
+    html.push_str("<table class=\"cells\">\n<thead><tr><th>列</th><th>旧值</th><th>新值</th></tr></thead>\n<tbody>\n");
+    for cell in cells {
+        let old = cell_side_html(
+            cell.old.as_deref(),
+            cell.diff.as_ref().map(|diff| diff.old.as_slice()),
+        );
+        let new = cell_side_html(
+            cell.new.as_deref(),
+            cell.diff.as_ref().map(|diff| diff.new.as_slice()),
+        );
+        let _ = writeln!(
+            html,
+            "<tr><td class=\"col\">{}</td><td class=\"old\">{}</td><td class=\"new\">{}</td></tr>",
+            escape_html(&cell.column),
+            old,
+            new
+        );
+    }
+    html.push_str("</tbody>\n</table>\n");
+}
+
+fn cell_side_html(value: Option<&str>, spans: Option<&[DiffSpan]>) -> String {
+    match spans {
+        Some(spans) => render_inline_html(spans),
+        None => match value {
+            Some(value) => format_text_html(value),
+            None => "<span class=\"empty\">—</span>".to_string(),
+        },
+    }
+}
+
+fn render_inline_html(spans: &[DiffSpan]) -> String {
+    let mut html = String::new();
+    for span in spans {
+        let text = format_text_html(&span.text);
+        match span.op {
+            DiffOp::Equal => html.push_str(&text),
+            DiffOp::Delete => {
+                let _ = write!(html, "<del>{text}</del>");
+            }
+            DiffOp::Insert => {
+                let _ = write!(html, "<ins>{text}</ins>");
+            }
+        }
+    }
+    html
 }
 
 fn render_markdown(output: &CompareOutput) -> String {
@@ -402,7 +462,9 @@ fn render_record_markdown(md: &mut String, record: &Record) {
 
     match record.status {
         Status::Modified | Status::SuspectedModified => {
-            if let Some(diff) = &record.diff {
+            if let Some(cells) = record.row_diff.as_deref().filter(|cells| !cells.is_empty()) {
+                render_cell_changes_markdown(md, cells);
+            } else if let Some(diff) = &record.diff {
                 let _ = writeln!(md, "**旧文（删除线为旧内容）**");
                 let _ = writeln!(md);
                 let _ = writeln!(md, "{}", render_diff_markdown(&diff.old));
@@ -439,6 +501,45 @@ fn render_record_markdown(md: &mut String, record: &Record) {
         }
         Status::Unchanged => {}
     }
+}
+
+fn render_cell_changes_markdown(md: &mut String, cells: &[CellChange]) {
+    let _ = writeln!(md, "**单元格差异（仅列出有变化的单元格）**");
+    let _ = writeln!(md);
+    let _ = writeln!(md, "| 列 | 旧值 | 新值 |");
+    let _ = writeln!(md, "| --- | --- | --- |");
+    for cell in cells {
+        let old = cell_side_markdown(
+            cell.old.as_deref(),
+            cell.diff.as_ref().map(|diff| diff.old.as_slice()),
+        );
+        let new = cell_side_markdown(
+            cell.new.as_deref(),
+            cell.diff.as_ref().map(|diff| diff.new.as_slice()),
+        );
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} |",
+            markdown_cell(&cell.column),
+            old,
+            new
+        );
+    }
+    let _ = writeln!(md);
+}
+
+fn cell_side_markdown(value: Option<&str>, spans: Option<&[DiffSpan]>) -> String {
+    match spans {
+        Some(spans) => markdown_cell(&render_diff_markdown(spans)),
+        None => match value {
+            Some(value) => markdown_cell(&format_text_html(value)),
+            None => "—".to_string(),
+        },
+    }
+}
+
+fn markdown_cell(text: &str) -> String {
+    text.replace('|', "\\|")
 }
 
 fn render_diff_markdown(spans: &[crate::result::DiffSpan]) -> String {
@@ -532,6 +633,7 @@ mod tests {
                 total: 0.0,
             },
             diff: None,
+            row_diff: None,
             matched_to: None,
             note: None,
             table: None,
@@ -558,5 +660,65 @@ mod tests {
         let md = render_markdown(&output);
         // Markdown 中的代码围栏内容按字面渲染，不会执行其中的 HTML。
         assert!(md.contains("```text\n<script>alert(1)</script>\n```"));
+    }
+
+    #[test]
+    fn renders_only_changed_table_cells() {
+        let record = Record {
+            id: 1,
+            status: Status::Modified,
+            old_para_index: None,
+            new_para_index: None,
+            old_text: Some("售电量 | 100 | 200".to_string()),
+            new_text: Some("售电量 | 120 | 200".to_string()),
+            scores: crate::result::Scores {
+                text: 0.9,
+                semantic: None,
+                total: 0.9,
+            },
+            diff: Some(crate::diff::para_diff("100", "120")),
+            row_diff: Some(vec![CellChange {
+                column: "本月".to_string(),
+                old: Some("100".to_string()),
+                new: Some("120".to_string()),
+                diff: Some(crate::diff::para_diff("100", "120")),
+            }]),
+            matched_to: Some(2),
+            note: None,
+            table: Some(crate::result::TableLocation {
+                table: 1,
+                old_row: Some(2),
+                new_row: Some(2),
+                caption: None,
+            }),
+            order: 0.0,
+        };
+        let output = CompareOutput {
+            old_path: PathBuf::from("old.docx"),
+            new_path: PathBuf::from("new.docx"),
+            old_paragraphs: 0,
+            new_paragraphs: 0,
+            old_tables: 1,
+            new_tables: 1,
+            records: vec![record],
+            summary: Summary {
+                modified: 1,
+                ..Summary::default()
+            },
+            semantic: SemanticStatus::disabled("测试"),
+            elapsed: std::time::Duration::from_millis(1),
+        };
+        let html = render_html(&output);
+        assert!(html.contains("单元格差异（仅列出有变化的单元格）"));
+        assert!(html.contains("<td class=\"col\">本月</td>"));
+        assert!(html.contains("<del>"));
+        assert!(html.contains("<ins>"));
+        assert!(!html.contains("旧文（删除线为旧内容）"));
+
+        let md = render_markdown(&output);
+        assert!(md.contains("**单元格差异（仅列出有变化的单元格）**"));
+        assert!(md.contains("| 本月 |"));
+        assert!(md.contains("<del>"));
+        assert!(!md.contains("**旧文（删除线为旧内容）**"));
     }
 }

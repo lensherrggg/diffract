@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::config::{Config, SimilarityConfig};
 use crate::docx::{Table, TableRow};
 use crate::normalize::normalize_for_match;
-use crate::result::{Record, Scores, Status, TableLocation};
+use crate::result::{CellChange, Record, Scores, Status, TableLocation};
 
 use super::text_sim::{TextFeatures, cosine, text_similarity};
 
@@ -18,7 +18,7 @@ pub struct TableVectors {
 
 /// 用于嵌入的行文本：剔除本表的序号列、去掉尾部空格，与行比较口径一致。
 pub fn semantic_texts(table: &Table) -> Vec<String> {
-    let ignored = ignored_columns(table, table);
+    let ignored = ordinal_columns(table);
     table
         .rows
         .iter()
@@ -155,27 +155,39 @@ fn table_pair_score(old: &Table, new: &Table, old_total: usize, new_total: usize
     if weight == 0.0 { 0.0 } else { score / weight }
 }
 
-fn key_set(table: &Table) -> HashSet<&str> {
+fn key_set(table: &Table) -> HashSet<String> {
     if ordinal_column(table, 0) {
         return HashSet::new();
     }
     table
         .rows
         .iter()
-        .filter_map(|row| row.key.as_deref())
+        .filter_map(|row| row.key.as_ref().map(|key| key.to_string()))
         .collect()
 }
 
-fn row_set(table: &Table) -> HashSet<&str> {
+/// 行签名按单元格内容排序，列顺序变化不影响签名，便于把“仅挪动列”的表配成同一张。
+fn row_set(table: &Table) -> HashSet<String> {
     table
         .rows
         .iter()
-        .map(|row| row.normalized.as_str())
+        .map(row_signature)
         .filter(|text| !text.is_empty())
         .collect()
 }
 
-fn set_jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
+fn row_signature(row: &TableRow) -> String {
+    let mut values: Vec<String> = row
+        .cells
+        .iter()
+        .map(|cell| normalize_for_match(cell.trim()))
+        .filter(|value| !value.is_empty())
+        .collect();
+    values.sort_unstable();
+    values.join("\u{1f}")
+}
+
+fn set_jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
@@ -227,10 +239,9 @@ fn ordinal_column(table: &Table, column: usize) -> bool {
     consecutive * 10 >= steps * 8
 }
 
-fn ignored_columns(old: &Table, new: &Table) -> Vec<bool> {
-    let columns = max_columns(old).max(max_columns(new));
-    (0..columns)
-        .map(|column| ordinal_column(old, column) || ordinal_column(new, column))
+fn ordinal_columns(table: &Table) -> Vec<bool> {
+    (0..max_columns(table))
+        .map(|column| ordinal_column(table, column))
         .collect()
 }
 
@@ -252,42 +263,381 @@ fn column_is_usable(table: &Table, column: usize) -> bool {
     unique.len() >= 2 && unique.len() * 10 >= values.len() * 7
 }
 
-/// 选第一个在两表中都足够唯一的非序号列作为行主键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Old,
+    New,
+}
+
+/// 一列在对齐结果中的映射；未匹配的列只有一侧有值。
+#[derive(Debug, Clone)]
+struct ColumnPair {
+    old: Option<usize>,
+    new: Option<usize>,
+    label: String,
+}
+
+struct ColumnAlignment {
+    pairs: Vec<ColumnPair>,
+    old_ignored: Vec<bool>,
+    new_ignored: Vec<bool>,
+}
+
+struct HeaderValue {
+    column: usize,
+    normalized: String,
+}
+
+/// 表头所在行。多数表格首行就是表头；首行若只有一格（常见于跨列表格标题），
+/// 则跳过它，在后两行里找第一行有多个非空单元格的作为表头。
+fn header_row(table: &Table, ignored: &[bool]) -> Option<usize> {
+    let meaningful = |row: &TableRow| {
+        row.cells
+            .iter()
+            .enumerate()
+            .filter(|(column, _)| !ignored.get(*column).copied().unwrap_or(false))
+            .filter(|(_, cell)| !cell.trim().is_empty())
+            .count()
+    };
+    table
+        .rows
+        .iter()
+        .take(3)
+        .position(|row| meaningful(row) >= 2)
+        .or_else(|| (!table.rows.is_empty()).then_some(0))
+}
+
+/// 表头行中的各列。列名为空的占位格也保留，供后面的按位置兜底使用。
+fn header_values(table: &Table, ignored: &[bool]) -> Vec<HeaderValue> {
+    let Some(index) = header_row(table, ignored) else {
+        return Vec::new();
+    };
+    table.rows[index]
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(column, _)| !ignored.get(*column).copied().unwrap_or(false))
+        .map(|(column, cell)| HeaderValue {
+            column,
+            normalized: normalize_for_match(cell.trim()),
+        })
+        .collect()
+}
+
+fn header_texts(table: &Table, ignored: &[bool]) -> Vec<String> {
+    header_row(table, ignored)
+        .and_then(|index| table.rows.get(index))
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 列名相似度用字符集合 Jaccard，短表头也能识别“本月”→“本月完成”这类改名。
+fn header_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    let a: HashSet<char> = a.chars().collect();
+    let b: HashSet<char> = b.chars().collect();
+    let intersection = a.intersection(&b).count();
+    let union = a.len() + b.len() - intersection;
+    if union == 0 {
+        1.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+/// 按表头对齐列：先精确配对唯一列名，再模糊配对改名，最后按剩余顺序兜底。
+/// 表头不足两列时退回按位置对齐。
+fn align_columns(old: &Table, new: &Table) -> ColumnAlignment {
+    let old_ignored = ordinal_columns(old);
+    let new_ignored = ordinal_columns(new);
+    let old_headers = header_values(old, &old_ignored);
+    let new_headers = header_values(new, &new_ignored);
+    let has_named_headers = old_headers
+        .iter()
+        .any(|header| !header.normalized.is_empty())
+        && new_headers
+            .iter()
+            .any(|header| !header.normalized.is_empty());
+    let (old_for_new, new_for_old) = if has_named_headers {
+        map_headers(
+            &old_headers,
+            &new_headers,
+            new_ignored.len(),
+            old_ignored.len(),
+        )
+    } else {
+        map_positionally(&old_ignored, &new_ignored)
+    };
+
+    let old_texts = header_texts(old, &old_ignored);
+    let new_texts = header_texts(new, &new_ignored);
+    let mut pairs = Vec::new();
+    for (new_column, old_column) in old_for_new.iter().copied().enumerate() {
+        if new_ignored[new_column] {
+            continue;
+        }
+        let label = new_texts
+            .get(new_column)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                old_column
+                    .and_then(|column| old_texts.get(column))
+                    .filter(|text| !text.is_empty())
+            })
+            .cloned()
+            .unwrap_or_else(|| format!("第{}列", new_column + 1));
+        pairs.push(ColumnPair {
+            old: old_column,
+            new: Some(new_column),
+            label,
+        });
+    }
+    for (old_column, new_column) in new_for_old.iter().enumerate() {
+        if !old_ignored[old_column] && new_column.is_none() {
+            let label = old_texts
+                .get(old_column)
+                .filter(|text| !text.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("第{}列", old_column + 1));
+            pairs.push(ColumnPair {
+                old: Some(old_column),
+                new: None,
+                label,
+            });
+        }
+    }
+
+    ColumnAlignment {
+        pairs,
+        old_ignored,
+        new_ignored,
+    }
+}
+
+fn map_headers(
+    old_headers: &[HeaderValue],
+    new_headers: &[HeaderValue],
+    new_columns: usize,
+    old_columns: usize,
+) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let mut old_for_new = vec![None; new_columns];
+    let mut new_for_old = vec![None; old_columns];
+
+    let mut old_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for header in old_headers {
+        old_by_name
+            .entry(header.normalized.as_str())
+            .or_default()
+            .push(header.column);
+    }
+    let mut new_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for header in new_headers {
+        new_by_name
+            .entry(header.normalized.as_str())
+            .or_default()
+            .push(header.column);
+    }
+    for header in old_headers {
+        if header.normalized.is_empty() || old_by_name[header.normalized.as_str()].len() != 1 {
+            continue;
+        }
+        if let Some(columns) = new_by_name.get(header.normalized.as_str()) {
+            if columns.len() == 1 {
+                pair_columns(
+                    header.column,
+                    columns[0],
+                    &mut old_for_new,
+                    &mut new_for_old,
+                );
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for old_header in old_headers {
+        if old_header.normalized.is_empty() || new_for_old[old_header.column].is_some() {
+            continue;
+        }
+        for new_header in new_headers {
+            if new_header.normalized.is_empty() || old_for_new[new_header.column].is_some() {
+                continue;
+            }
+            let score = header_similarity(&old_header.normalized, &new_header.normalized);
+            if score >= 0.5 {
+                candidates.push((score, old_header.column, new_header.column));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    for (_, old_column, new_column) in candidates {
+        if new_for_old[old_column].is_none() && old_for_new[new_column].is_none() {
+            pair_columns(old_column, new_column, &mut old_for_new, &mut new_for_old);
+        }
+    }
+
+    let unmatched_old: Vec<usize> = old_headers
+        .iter()
+        .map(|header| header.column)
+        .filter(|column| new_for_old[*column].is_none())
+        .collect();
+    let unmatched_new: Vec<usize> = new_headers
+        .iter()
+        .map(|header| header.column)
+        .filter(|column| old_for_new[*column].is_none())
+        .collect();
+    for (old_column, new_column) in unmatched_old.into_iter().zip(unmatched_new) {
+        pair_columns(old_column, new_column, &mut old_for_new, &mut new_for_old);
+    }
+
+    (old_for_new, new_for_old)
+}
+
+fn pair_columns(
+    old_column: usize,
+    new_column: usize,
+    old_for_new: &mut [Option<usize>],
+    new_for_old: &mut [Option<usize>],
+) {
+    old_for_new[new_column] = Some(old_column);
+    new_for_old[old_column] = Some(new_column);
+}
+
+fn map_positionally(
+    old_ignored: &[bool],
+    new_ignored: &[bool],
+) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let old_columns: Vec<usize> = old_ignored
+        .iter()
+        .enumerate()
+        .filter(|(_, ignored)| !**ignored)
+        .map(|(column, _)| column)
+        .collect();
+    let new_columns: Vec<usize> = new_ignored
+        .iter()
+        .enumerate()
+        .filter(|(_, ignored)| !**ignored)
+        .map(|(column, _)| column)
+        .collect();
+    let mut old_for_new = vec![None; new_ignored.len()];
+    let mut new_for_old = vec![None; old_ignored.len()];
+    for (old_column, new_column) in old_columns.into_iter().zip(new_columns) {
+        pair_columns(old_column, new_column, &mut old_for_new, &mut new_for_old);
+    }
+    (old_for_new, new_for_old)
+}
+
+/// 选第一个在两表中都足够唯一的已对齐列作为行主键。
 /// 序号列被跳过；合并类别列因重复过多不会入选，内容列会顶上。
-fn choose_key_column(old: &Table, new: &Table, ignored: &[bool]) -> Option<usize> {
-    (0..ignored.len()).find(|&column| {
-        !ignored[column] && column_is_usable(old, column) && column_is_usable(new, column)
+fn choose_key_columns(
+    alignment: &ColumnAlignment,
+    old: &Table,
+    new: &Table,
+) -> Option<(usize, usize)> {
+    alignment.pairs.iter().find_map(|pair| {
+        let (old_column, new_column) = (pair.old?, pair.new?);
+        (column_is_usable(old, old_column) && column_is_usable(new, new_column))
+            .then_some((old_column, new_column))
     })
 }
 
 struct RowView {
+    /// 按对齐后的列顺序存放的单元格，用于行比较和单元格差异。
     cells: Vec<String>,
+    /// 原始顺序的一行文本，用于报告展示。
     text: String,
+    /// 对齐后内容的归一化文本，列顺序变化不会造成误判。
     normalized: String,
     key: Option<String>,
     features: TextFeatures,
 }
 
-fn build_view(table: &Table, ignored: &[bool], key_column: Option<usize>) -> Vec<RowView> {
+fn build_view(
+    table: &Table,
+    side: Side,
+    alignment: &ColumnAlignment,
+    key_column: Option<usize>,
+) -> Vec<RowView> {
+    let ignored = match side {
+        Side::Old => &alignment.old_ignored,
+        Side::New => &alignment.new_ignored,
+    };
     table
         .rows
         .iter()
         .map(|row| {
-            let text = visible_text(row, ignored);
-            let normalized = normalize_for_match(&text);
+            let mut cells: Vec<String> = alignment
+                .pairs
+                .iter()
+                .map(|pair| {
+                    let column = match side {
+                        Side::Old => pair.old,
+                        Side::New => pair.new,
+                    };
+                    column
+                        .and_then(|column| row.cells.get(column))
+                        .map(|cell| cell.trim().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            while cells.last().is_some_and(|cell| cell.is_empty()) {
+                cells.pop();
+            }
+            let aligned_text = cells.join(" | ");
+            let normalized = normalize_for_match(&aligned_text);
             let key = key_column
                 .and_then(|column| row.cells.get(column))
                 .map(|cell| normalize_for_match(cell.trim()))
                 .filter(|value| !value.is_empty());
             RowView {
-                cells: visible_cells(row, ignored),
+                cells,
                 features: TextFeatures::from_normalized(&normalized),
-                text,
+                text: visible_text(row, ignored),
                 normalized,
                 key,
             }
         })
         .collect()
+}
+
+fn row_cell_changes(
+    old: &TableRow,
+    new: &TableRow,
+    alignment: &ColumnAlignment,
+) -> Vec<CellChange> {
+    let mut changes = Vec::new();
+    for pair in &alignment.pairs {
+        let old_value = pair
+            .old
+            .and_then(|column| old.cells.get(column))
+            .map(|cell| cell.trim())
+            .unwrap_or("");
+        let new_value = pair
+            .new
+            .and_then(|column| new.cells.get(column))
+            .map(|cell| cell.trim())
+            .unwrap_or("");
+        if old_value == new_value || (old_value.is_empty() && new_value.is_empty()) {
+            continue;
+        }
+        changes.push(CellChange {
+            column: pair.label.clone(),
+            old: (!old_value.is_empty()).then(|| old_value.to_string()),
+            new: (!new_value.is_empty()).then(|| new_value.to_string()),
+            diff: None,
+        });
+    }
+    changes
 }
 
 fn visible_cells(row: &TableRow, ignored: &[bool]) -> Vec<String> {
@@ -584,10 +934,10 @@ fn compare_table_pair(
     old_vectors: Option<&[Vec<f32>]>,
     new_vectors: Option<&[Vec<f32>]>,
 ) -> Vec<Record> {
-    let ignored = ignored_columns(old, new);
-    let key_column = choose_key_column(old, new, &ignored);
-    let old_rows = build_view(old, &ignored, key_column);
-    let new_rows = build_view(new, &ignored, key_column);
+    let alignment = align_columns(old, new);
+    let key_columns = choose_key_columns(&alignment, old, new);
+    let old_rows = build_view(old, Side::Old, &alignment, key_columns.map(|pair| pair.0));
+    let new_rows = build_view(new, Side::New, &alignment, key_columns.map(|pair| pair.1));
     let semantic_available = old_vectors.is_some();
     let (pairs, removed_rows, added_rows) = align_rows(
         &old_rows,
@@ -604,6 +954,21 @@ fn compare_table_pair(
         let old_row = &old_rows[pair.old];
         let new_row = &new_rows[pair.new];
         if old_row.normalized == new_row.normalized {
+            if pair.out_of_order {
+                records.push(table_move_record(
+                    old.rows[pair.old].index,
+                    new.rows[pair.new].index,
+                    new_row.text.clone(),
+                    new.anchor,
+                    table_number,
+                    caption.clone(),
+                    semantic_available,
+                ));
+            }
+            continue;
+        }
+        let cell_changes = row_cell_changes(&old.rows[pair.old], &new.rows[pair.new], &alignment);
+        if cell_changes.is_empty() {
             if pair.out_of_order {
                 records.push(table_move_record(
                     old.rows[pair.old].index,
@@ -655,6 +1020,7 @@ fn compare_table_pair(
                 total: pair.scores.total,
             },
             diff: None,
+            row_diff: Some(cell_changes),
             matched_to: Some(new.rows[pair.new].index + 1),
             note: (!note.is_empty()).then_some(note),
             table: Some(TableLocation {
@@ -678,6 +1044,7 @@ fn compare_table_pair(
             new_text: None,
             scores: Scores::empty(),
             diff: None,
+            row_diff: None,
             matched_to: None,
             note: Some(format!("整行删除{}", caption_suffix(caption.as_deref()))),
             table: Some(TableLocation {
@@ -701,6 +1068,7 @@ fn compare_table_pair(
             new_text: Some(row.text.clone()),
             scores: Scores::empty(),
             diff: None,
+            row_diff: None,
             matched_to: None,
             note: Some(format!("整行新增{}", caption_suffix(caption.as_deref()))),
             table: Some(TableLocation {
@@ -734,6 +1102,7 @@ fn table_move_record(
         new_text: Some(text),
         scores: Scores::exact(semantic_available),
         diff: None,
+        row_diff: None,
         matched_to: Some(new_index + 1),
         note: Some("内容相同，行顺序变化".to_string()),
         table: Some(TableLocation {
@@ -772,6 +1141,7 @@ fn whole_table_record(table: &Table, added: bool) -> Record {
         new_text: added.then(|| text),
         scores: Scores::empty(),
         diff: None,
+        row_diff: None,
         matched_to: None,
         note: Some(format!(
             "{verb}，共 {} 行{}",
@@ -834,7 +1204,6 @@ mod tests {
             .map(|(row_index, cells)| {
                 let cells: Vec<String> = cells.iter().map(|cell| cell.to_string()).collect();
                 let text = cells.join(" | ");
-                let normalized = normalize_for_match(&text);
                 let key = cells
                     .first()
                     .map(|cell| normalize_for_match(cell))
@@ -843,7 +1212,6 @@ mod tests {
                     index: row_index,
                     cells,
                     text,
-                    normalized,
                     key,
                 }
             })
@@ -1199,5 +1567,270 @@ mod tests {
         assert_eq!(records.len(), 1, "{records:#?}");
         assert_eq!(records[0].scores.semantic, None);
         assert_eq!(records[0].scores.total, records[0].scores.text);
+    }
+
+    #[test]
+    fn inserted_column_only_touches_header() {
+        let old = table(
+            0,
+            1,
+            &[&["指标", "本月"], &["售电量", "100"], &["电价", "0.6"]],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["指标", "新增列", "本月"],
+                &["售电量", "", "100"],
+                &["电价", "", "0.6"],
+            ],
+        );
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].status, Status::Modified);
+        let location = records[0].table.as_ref().unwrap();
+        assert_eq!(location.old_row, Some(1));
+        assert_eq!(location.new_row, Some(1));
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "新增列");
+        assert_eq!(cells[0].old, None);
+        assert_eq!(cells[0].new.as_deref(), Some("新增列"));
+    }
+
+    #[test]
+    fn merged_title_row_uses_the_real_header_for_cell_labels() {
+        let old = table(
+            0,
+            1,
+            &[
+                &["2026年指标完成情况", "", "", ""],
+                &["类别", "指标", "本月", "累计"],
+                &["营销", "售电量", "100", "200"],
+                &["营销", "电价", "0.6", "1.2"],
+            ],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["2026年指标完成情况", "", "", ""],
+                &["类别", "指标", "本月", "累计"],
+                &["营销", "售电量", "120", "200"],
+                &["营销", "电价", "0.6", "1.2"],
+            ],
+        );
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "本月");
+        assert_eq!(cells[0].old.as_deref(), Some("100"));
+        assert_eq!(cells[0].new.as_deref(), Some("120"));
+    }
+
+    #[test]
+    fn moved_and_edited_column_reports_the_aligned_cell() {
+        let old = table(
+            0,
+            1,
+            &[
+                &["指标", "本月", "累计"],
+                &["售电量", "100", "200"],
+                &["电价", "0.6", "1.2"],
+            ],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["累计", "指标", "本月"],
+                &["200", "售电量", "120"],
+                &["1.2", "电价", "0.6"],
+            ],
+        );
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].status, Status::Modified);
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "本月");
+        assert_eq!(cells[0].old.as_deref(), Some("100"));
+        assert_eq!(cells[0].new.as_deref(), Some("120"));
+    }
+
+    #[test]
+    fn inserted_column_is_aligned_after_ordinal_column() {
+        let old = table(
+            0,
+            1,
+            &[
+                &["序号", "指标", "本月"],
+                &["1", "售电量", "100"],
+                &["2", "电价", "0.6"],
+                &["3", "投诉", "3"],
+            ],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["序号", "指标", "备注", "本月"],
+                &["1", "售电量", "", "100"],
+                &["2", "电价", "", "0.6"],
+                &["3", "投诉", "", "3"],
+            ],
+        );
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "备注");
+        assert_eq!(cells[0].new.as_deref(), Some("备注"));
+    }
+
+    #[test]
+    fn column_inserted_before_single_column_table_aligns_by_header() {
+        let old = table(0, 1, &[&["指标"], &["售电量"]]);
+        let new = table(0, 1, &[&["备注", "指标"], &["", "售电量"]]);
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "备注");
+        assert_eq!(cells[0].old, None);
+        assert_eq!(cells[0].new.as_deref(), Some("备注"));
+    }
+
+    #[test]
+    fn filled_inserted_column_is_reported_per_row() {
+        let old = table(
+            0,
+            1,
+            &[&["指标", "本月"], &["售电量", "100"], &["电价", "0.6"]],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["指标", "来源", "本月"],
+                &["售电量", "营销部", "100"],
+                &["电价", "营销部", "0.6"],
+            ],
+        );
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 3, "{records:#?}");
+        for record in &records {
+            let cells = record.row_diff.as_ref().unwrap();
+            assert_eq!(cells.len(), 1, "{cells:#?}");
+            assert_eq!(cells[0].column, "来源");
+        }
+    }
+
+    #[test]
+    fn moved_column_is_not_a_modification() {
+        let old = table(
+            0,
+            1,
+            &[
+                &["指标", "本月", "累计"],
+                &["售电量", "100", "200"],
+                &["电价", "0.6", "1.2"],
+            ],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["本月", "指标", "累计"],
+                &["100", "售电量", "200"],
+                &["0.6", "电价", "1.2"],
+            ],
+        );
+        assert!(run(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn renamed_column_only_touches_header() {
+        let old = table(0, 1, &[&["指标", "本月"], &["售电量", "100"]]);
+        let new = table(0, 1, &[&["指标", "本月完成"], &["售电量", "100"]]);
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].status, Status::Modified);
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "本月完成");
+        assert_eq!(cells[0].old.as_deref(), Some("本月"));
+        assert_eq!(cells[0].new.as_deref(), Some("本月完成"));
+    }
+
+    #[test]
+    fn unrelated_renamed_header_aligns_by_position() {
+        let old = table(0, 1, &[&["指标", "本月"], &["售电量", "100"]]);
+        let new = table(0, 1, &[&["指标", "本期"], &["售电量", "100"]]);
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells[0].column, "本期");
+        assert_eq!(cells[0].old.as_deref(), Some("本月"));
+    }
+
+    #[test]
+    fn row_diff_lists_only_changed_cells() {
+        let old = table(
+            0,
+            1,
+            &[
+                &["指标", "本月", "累计"],
+                &["售电量", "100", "200"],
+                &["电价", "0.6", "1.2"],
+            ],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["指标", "本月", "累计"],
+                &["售电量", "120", "200"],
+                &["电价", "0.6", "1.2"],
+            ],
+        );
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].status, Status::Modified);
+        let cells = records[0].row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "本月");
+        assert_eq!(cells[0].old.as_deref(), Some("100"));
+        assert_eq!(cells[0].new.as_deref(), Some("120"));
+    }
+
+    #[test]
+    fn removed_column_reports_removed_cells() {
+        let old = table(
+            0,
+            1,
+            &[
+                &["指标", "本月", "备注"],
+                &["售电量", "100", "已完成"],
+                &["电价", "0.6", ""],
+            ],
+        );
+        let new = table(
+            0,
+            1,
+            &[&["指标", "本月"], &["售电量", "100"], &["电价", "0.6"]],
+        );
+        let records = run(&old, &new);
+        assert_eq!(records.len(), 2, "{records:#?}");
+        let row = records
+            .iter()
+            .find(|record| record.table.as_ref().unwrap().old_row == Some(2))
+            .unwrap();
+        let cells = row.row_diff.as_ref().unwrap();
+        assert_eq!(cells.len(), 1, "{cells:#?}");
+        assert_eq!(cells[0].column, "备注");
+        assert_eq!(cells[0].old.as_deref(), Some("已完成"));
+        assert_eq!(cells[0].new, None);
     }
 }

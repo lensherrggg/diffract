@@ -89,6 +89,19 @@ pub struct ParaDiff {
     pub new: Vec<DiffSpan>,
 }
 
+/// 表格一行中单个单元格的变化。仅变化单元格会进入记录。
+#[derive(Debug, Clone, Serialize)]
+pub struct CellChange {
+    /// 对齐后的列名，优先取新表表头。
+    pub column: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<ParaDiff>,
+}
+
 /// 表格记录的位置。表号、行号对外统一使用 1 起始编号。
 #[derive(Debug, Clone, Serialize)]
 pub struct TableLocation {
@@ -123,6 +136,9 @@ pub struct Record {
     pub scores: Scores,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<ParaDiff>,
+    /// 表格行专用：只列出内容发生变化的单元格。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_diff: Option<Vec<CellChange>>,
     pub matched_to: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
