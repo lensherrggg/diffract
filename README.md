@@ -70,7 +70,85 @@ diffract.exe --html 对比报告.html --md 对比报告.md 旧版.docx 新版.do
 
 ### 启用语义匹配
 
-源码仓库不包含模型文件（`models/` 已列入 `.gitignore`），需要自行下载 `BAAI/bge-small-zh-v1.5` 的 ONNX 导出和 tokenizer 后放到本地。便携包是在构建时把模型一起打包的，所以解压即可用。
+源码仓库不包含模型文件（`models/` 已列入 `.gitignore`），需要自行准备 `BAAI/bge-small-zh-v1.5` 的 ONNX 导出和 tokenizer。便携包是在构建时把模型一起打包的，所以解压即可用。
+
+#### 下载模型
+
+**方式 A：从已有的便携包复制（最省事，推荐）**
+
+如果手边有本项目的便携包，模型已经在里面，不需要联网：
+
+```powershell
+# 解压便携包（按实际路径修改）
+Expand-Archive .\dist\diffRact-0.1.0-win64.zip -DestinationPath .\dist\portable
+
+# 建好 models 目录并复制
+New-Item -ItemType Directory -Force .\models | Out-Null
+Copy-Item .\dist\portable\diffRact-0.1.0-win64\models\* .\models\ -Force
+```
+
+复制后应得到：
+
+```text
+models/
+  model.onnx
+  tokenizer.json
+```
+
+这种方式拿到的是项目测试过的同一份模型，默认 `diffract.toml` 可以直接使用。
+
+**方式 B：从 Hugging Face 下载 ONNX 转换**
+
+`BAAI/bge-small-zh-v1.5` 的官方仓库主要是 PyTorch 权重；这里使用社区转换好的 ONNX 版本 `onnx-community/bge-small-zh-v1.5-ONNX`。它和 Transformers.js 兼容，输出 `last_hidden_state`，隐藏维度 512，适合本项目的 `pooling = "cls"`。
+
+```powershell
+python -m pip install -U huggingface_hub
+
+# 国内网络如果访问 huggingface.co 失败，先设置镜像
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+
+hf download onnx-community/bge-small-zh-v1.5-ONNX --local-dir models/bge-small-zh-v1.5-ONNX
+```
+
+下载完成后可以二选一：
+
+1. 直接在 `diffract.toml` 指向下载目录：
+
+   ```toml
+   [model]
+   path = "models/bge-small-zh-v1.5-ONNX/onnx/model.onnx"
+   tokenizer_path = "models/bge-small-zh-v1.5-ONNX/tokenizer.json"
+   ```
+
+2. 或者复制成默认的扁平结构：
+
+   ```powershell
+   Copy-Item models\bge-small-zh-v1.5-ONNX\onnx\model.onnx .\models\model.onnx -Force
+   Copy-Item models\bge-small-zh-v1.5-ONNX\onnx\model.onnx_data .\models\model.onnx_data -Force
+   Copy-Item models\bge-small-zh-v1.5-ONNX\tokenizer.json .\models\tokenizer.json -Force
+   ```
+
+> `model.onnx` 和 `model.onnx_data` 必须放在同一目录。当前 ONNX Community 版本把权重放在外部数据文件里，只复制 `model.onnx`（约 41 KB）会导致模型加载失败。
+>
+> 如果下载到的是单文件 `model.onnx`（没有 `model.onnx_data`），只复制 `model.onnx` 和 `tokenizer.json` 即可。
+
+**方式 C：浏览器手动下载**
+
+打开 [onnx-community/bge-small-zh-v1.5-ONNX 文件页](https://huggingface.co/onnx-community/bge-small-zh-v1.5-ONNX/tree/main/onnx)（国内可用 [hf-mirror 镜像](https://hf-mirror.com/onnx-community/bge-small-zh-v1.5-ONNX/tree/main/onnx)），下载：
+
+- `onnx/model.onnx`
+- `onnx/model.onnx_data`
+- 根目录的 `tokenizer.json`
+
+按方式 B 的第 1 或第 2 种结构放置。
+
+下载后建议用 `--require-semantic` 验证一次，模型不可用时会直接报错而不是静默降级：
+
+```bat
+diffract.exe --require-semantic --check 旧版.docx 新版.docx
+```
+
+输出中看到“语义匹配已启用（model.onnx，512 维）”即表示模型加载成功。若只需要纯文本比较，可以不下载模型，使用 `--no-semantic`。
 
 配置步骤：
 
