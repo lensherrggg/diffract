@@ -19,7 +19,17 @@
 
 ## 3. 获取模型
 
-### 最快：从便携包复制
+### 最快：使用内置命令
+
+源码构建后直接运行：
+
+```powershell
+cargo run -- download-model --mirror
+```
+
+默认下载到 `models/`；指定目录用 `--dir`，覆盖已有文件用 `--force`。只有这个子命令访问网络。
+
+### 离线：从便携包复制
 
 如果仓库里或手边有 `dist/diffRact-0.1.0-win64.zip`，直接取其中的 `models/`：
 

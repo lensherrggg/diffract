@@ -14,27 +14,56 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 
 use config::{Config, Overrides, Pooling};
 use matching::Progress;
+use model::download;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "diffract",
     version,
     about = "diffRact：本地 .docx 段落与表格行级版本比较工具",
-    long_about = "比较两个 .docx 的段落与表格行，识别未变、新增、删除、修改、移动、疑似修改六类差异。表格按行级记录，纵向合并单元格按内容展开到覆盖的每一行。默认进入 TUI；--check 或 --html/--md 用于 CI 和批处理。"
+    long_about = "比较两个 .docx 的段落与表格行，识别未变、新增、删除、修改、移动、疑似修改六类差异。表格按行级记录，纵向合并单元格按内容展开到覆盖的每一行。默认进入 TUI；--check 或 --html/--md 用于 CI 和批处理。使用 download-model 子命令可显式下载语义模型（仅该命令联网）。",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
+    #[command(flatten)]
+    compare: CompareArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    /// 下载语义模型到本地（仅此命令访问网络）
+    DownloadModel {
+        /// 模型输出目录
+        #[arg(long, value_name = "DIR", default_value = "models")]
+        dir: PathBuf,
+
+        /// 使用 hf-mirror.com 镜像
+        #[arg(long)]
+        mirror: bool,
+
+        /// 覆盖已存在的模型文件
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+struct CompareArgs {
     /// 旧版本 .docx
     #[arg(value_name = "OLD")]
-    old: PathBuf,
+    old: Option<PathBuf>,
 
     /// 新版本 .docx
     #[arg(value_name = "NEW")]
-    new: PathBuf,
+    new: Option<PathBuf>,
 
     /// 非交互模式：输出统计并按 0/1/2 退出
     #[arg(long)]
@@ -133,38 +162,46 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
-    let overrides = Overrides {
-        window: cli.window,
-        weight_text: cli.weight_text,
-        weight_semantic: cli.weight_semantic,
-        threshold_modified: cli.threshold_modified,
-        threshold_suspected: cli.threshold_suspected,
-        text_candidate_threshold: cli.text_candidate_threshold,
-        model_path: cli.model,
-        tokenizer_path: cli.tokenizer,
-        max_seq_len: cli.max_seq_len,
-        no_semantic: cli.no_semantic,
-        require_semantic: cli.require_semantic,
-        output_name: cli.output_name,
-        pooling: cli.pooling,
-        dim: cli.dim,
-        context_chars: cli.context_chars,
-        log_path: cli.log,
-        log_level: cli.log_level,
-    };
-    let config = Config::load(cli.config.as_deref(), &overrides)?;
-    logging::init(&config.log)?;
-    log::info!(
-        "diffract 启动：{} -> {}",
-        cli.old.display(),
-        cli.new.display()
-    );
+    if let Some(CliCommand::DownloadModel { dir, mirror, force }) = cli.command {
+        let endpoint = if mirror {
+            download::MIRROR_ENDPOINT
+        } else {
+            download::DEFAULT_ENDPOINT
+        };
+        download::download_models(&dir, endpoint, force)?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
-    if cli.check || cli.html.is_some() || cli.md.is_some() {
+    let compare = cli.compare;
+    let old = compare.old.context("缺少旧版本 .docx（OLD）")?;
+    let new = compare.new.context("缺少新版本 .docx（NEW）")?;
+    let overrides = Overrides {
+        window: compare.window,
+        weight_text: compare.weight_text,
+        weight_semantic: compare.weight_semantic,
+        threshold_modified: compare.threshold_modified,
+        threshold_suspected: compare.threshold_suspected,
+        text_candidate_threshold: compare.text_candidate_threshold,
+        model_path: compare.model,
+        tokenizer_path: compare.tokenizer,
+        max_seq_len: compare.max_seq_len,
+        no_semantic: compare.no_semantic,
+        require_semantic: compare.require_semantic,
+        output_name: compare.output_name,
+        pooling: compare.pooling,
+        dim: compare.dim,
+        context_chars: compare.context_chars,
+        log_path: compare.log,
+        log_level: compare.log_level,
+    };
+    let config = Config::load(compare.config.as_deref(), &overrides)?;
+    logging::init(&config.log)?;
+    log::info!("diffract 启动：{} -> {}", old.display(), new.display());
+
+    if compare.check || compare.html.is_some() || compare.md.is_some() {
         let mut progress = CheckProgress::new();
-        let output = engine::compare_files(&cli.old, &cli.new, &config, &mut |update| {
-            progress.update(update)
-        });
+        let output =
+            engine::compare_files(&old, &new, &config, &mut |update| progress.update(update));
         progress.finish();
         let output = match output {
             Ok(output) => output,
@@ -173,17 +210,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Err(err);
             }
         };
-        if let Some(path) = cli.html.as_deref() {
+        if let Some(path) = compare.html.as_deref() {
             report::export_html(&output, path)?;
         }
-        if let Some(path) = cli.md.as_deref() {
+        if let Some(path) = compare.md.as_deref() {
             report::export_markdown(&output, path)?;
         }
         print!("{}", report::check_report(&output));
-        if let Some(path) = cli.html.as_deref() {
+        if let Some(path) = compare.html.as_deref() {
             println!("HTML 报告：{}", path.display());
         }
-        if let Some(path) = cli.md.as_deref() {
+        if let Some(path) = compare.md.as_deref() {
             println!("Markdown 报告：{}", path.display());
         }
         std::io::stdout().flush()?;
@@ -196,7 +233,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         if !std::io::stdout().is_terminal() {
             anyhow::bail!("TUI 需要交互式终端；请在 CI 或管道中使用 --check 或 --html/--md");
         }
-        tui::run(cli.old, cli.new, config)
+        tui::run(old, new, config)
     }
 }
 
@@ -261,9 +298,9 @@ mod tests {
             "out/report.md",
         ])
         .unwrap();
-        assert_eq!(cli.html, Some(PathBuf::from("out/report.html")));
-        assert_eq!(cli.md, Some(PathBuf::from("out/report.md")));
-        assert!(!cli.check);
+        assert_eq!(cli.compare.html, Some(PathBuf::from("out/report.html")));
+        assert_eq!(cli.compare.md, Some(PathBuf::from("out/report.md")));
+        assert!(!cli.compare.check);
     }
 
     #[test]
@@ -276,6 +313,34 @@ mod tests {
             "report.md",
         ])
         .unwrap();
-        assert_eq!(cli.md, Some(PathBuf::from("report.md")));
+        assert_eq!(cli.compare.md, Some(PathBuf::from("report.md")));
+    }
+
+    #[test]
+    fn download_model_subcommand_is_parsed() {
+        let cli = Cli::try_parse_from([
+            "diffract",
+            "download-model",
+            "--mirror",
+            "--dir",
+            "D:\\models",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(CliCommand::DownloadModel { dir, mirror, force }) => {
+                assert_eq!(dir, PathBuf::from("D:\\models"));
+                assert!(mirror);
+                assert!(force);
+            }
+            None => panic!("download-model 子命令未被识别"),
+        }
+    }
+
+    #[test]
+    fn compare_args_do_not_require_paths_when_downloading() {
+        let cli = Cli::try_parse_from(["diffract", "download-model"]).unwrap();
+        assert!(cli.compare.old.is_none());
+        assert!(cli.compare.new.is_none());
     }
 }

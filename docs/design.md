@@ -31,11 +31,11 @@ diffRact 是一个完全本地运行的 `.docx` 版本比较工具。它把两�
 - 不做像素级/版式级比较，字体、颜色、边框、列宽等格式变化不构成差异；
 - 不判断改动意图，只按文本和结构相似度给出“修改/疑似修改”；
 - 不提供服务器、Web 界面或多人协作能力；
-- 运行时不访问网络，模型文件需要用户自行准备。
+- 正常比较不访问网络，模型文件需要用户自行准备；只有显式的 `download-model` 子命令会联网。
 
 ## 2. 设计原则
 
-1. **本地优先**：文档解析、相似度计算、报告生成全部在本机完成；除首次构建下载依赖外，运行期无网络访问。
+1. **本地优先**：文档解析、相似度计算、报告生成全部在本机完成；正常比较无网络访问，只有显式 `download-model` 会下载模型。
 2. **匹配与展示分离**：归一化文本只用于匹配，报告和界面永远展示原文。
 3. **启发式可解释**：相似度由字符、分词和语义三部分构成；阈值、权重、窗口都可通过配置文件或命令行调整。
 4. **宁可疑似，不可漏报**：低于确认阈值但仍有较高相似度的配对保留为“疑似修改”，交给人工判断。
@@ -101,6 +101,7 @@ diffRact 是一个完全本地运行的 `.docx` 版本比较工具。它把两�
 | `src/matching/text_sim.rs` | 字符 3-gram、jieba 分词、Jaccard、余弦相似度 |
 | `src/matching/table.rs` | 表对齐、列对齐、行对齐、序号列、单元格差异、整表记录 |
 | `src/model/embedder.rs` | ONNX Runtime 会话、tokenizer、分块/批处理、池化、向量归一化 |
+| `src/model/download.rs` | `download-model` 子命令：从 Hugging Face/镜像下载模型，流式写盘、进度、跳过/覆盖 |
 | `src/diff.rs` | 基于 `similar` 的字符级 diff，以及 TUI 上下文裁剪 |
 | `src/result.rs` | 状态、分数、差异 span、表格/单元格差异、记录、汇总、比较输出 |
 | `src/engine.rs` | 解析 → 语义准备 → 段落匹配 → 表格匹配 → 排序编号 → 字符 diff → 汇总 |
@@ -242,6 +243,8 @@ struct CompareOutput {
 ### 5.3 语义向量
 
 实现：`engine::prepare_semantic` + `model::Embedder`。
+
+模型文件不在 git 中。首次使用先执行 `diffract.exe download-model`（或 `--mirror`），把 `model.onnx`、外置权重 `model.onnx_data` 和 `tokenizer.json` 放到 `models/`；该命令是运行期唯一的联网入口。
 
 1. 只有 `[model].enabled = true` 时尝试加载。
 2. 检查模型和 tokenizer 路径；加载 ONNX Runtime 会话，图优化 Level3，线程数取 CPU 并行度并限制在 1～8。
@@ -430,7 +433,10 @@ struct CompareOutput {
 
 ```text
 diffract.exe [OPTIONS] <OLD> <NEW>
+diffract.exe download-model [--dir <DIR>] [--mirror] [--force]
 ```
+
+`download-model` 是显式的模型准备命令：默认从 Hugging Face 下载 `onnx-community/bge-small-zh-v1.5-ONNX` 到 `models/`，`--mirror` 使用 hf-mirror.com，已存在文件默认跳过。该子命令是唯一会访问网络的运行路径。
 
 主要参数：
 
@@ -524,7 +530,7 @@ HTML 是单文件、内嵌样式，适合直接浏览、发送或打印。所有
 - 语义模型不是必需时，加载或推理错误转为 `SemanticStatus::disabled(reason)`，在 TUI 和报告中展示原因。
 - 日志通过 `log` 门面写入文件；`--log`/`[log].path` 未配置时完全关闭。
 - HTML 输出的所有动态文本（文件名、正文、备注、列名、diff span）都经过 `escape_html`。
-- 不执行文档中的宏、脚本或外部链接；运行时无网络请求。
+- 不执行文档中的宏、脚本或外部链接；正常比较无网络请求，只有显式 `download-model` 会访问模型仓库。
 
 ## 10. 性能设计
 
@@ -548,8 +554,9 @@ HTML 是单文件、内嵌样式，适合直接浏览、发送或打印。所有
 - 段落匹配：未变/新增/删除/移动、插入不误判移动、阈值判定、窗口偏移、拆分/合并、编号忽略、删除记录插序；
 - 表格匹配：表对齐、行增删改移、序号列、主键、语义分、列对齐、单元格差异；
 - 报告：HTML 转义、脚本注入、单元格差异渲染；
-- TUI：筛选循环与数字快捷键；
-- CLI：导出参数、Markdown 别名。
+- TUI：筛选循环、数字快捷键、详情换行缓存时机；
+- CLI：导出参数、Markdown 别名、`download-model` 子命令解析；
+- 模型下载：`.part` 路径、进度单位格式化。
 
 运行：
 

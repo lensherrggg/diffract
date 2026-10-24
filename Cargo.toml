@@ -18,4 +18,5 @@ similar = "3.2.0"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 toml = "1.1.8"
 unicode-normalization = "0.1.26"
+ureq = "3.5.0"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }

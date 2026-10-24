@@ -11,7 +11,7 @@
 | 删除（removed） | 旧文档中的段落或表格行在新文档中没有对应项 |
 | 移动（moved） | 归一化后文本完全相同，但位置发生变化 |
 
-所有计算均在本机完成，不上传文档，运行时也不访问网络。
+所有计算均在本机完成，不上传文档。正常比较不访问网络；只有显式执行 `download-model` 下载语义模型时会联网。
 
 ## 便携版
 
@@ -29,6 +29,8 @@ diffRact-0.1.0-win64/
 ├─ models/
 │  ├─ model.onnx            BAAI/bge-small-zh-v1.5（512 维）
 │  └─ tokenizer.json
+├─ docs/
+│  └─ design.md             项目总体设计
 └─ README.md
 ```
 
@@ -72,9 +74,40 @@ diffract.exe --html 对比报告.html --md 对比报告.md 旧版.docx 新版.do
 
 源码仓库不包含模型文件（`models/` 已列入 `.gitignore`），需要自行准备 `BAAI/bge-small-zh-v1.5` 的 ONNX 导出和 tokenizer。便携包是在构建时把模型一起打包的，所以解压即可用。
 
-#### 下载模型
+#### 方式 A：内置下载命令（推荐，会联网）
 
-**方式 A：从已有的便携包复制（最省事，推荐）**
+程序自带 `download-model` 子命令，默认从 Hugging Face 下载到当前目录的 `models/`：
+
+```bat
+diffract.exe download-model
+```
+
+国内网络建议使用镜像：
+
+```bat
+diffract.exe download-model --mirror
+```
+
+指定目录或覆盖已有文件：
+
+```bat
+diffract.exe download-model --dir D:\models --force
+```
+
+命令会下载并整理成默认配置需要的结构：
+
+```text
+models/
+  model.onnx
+  model.onnx_data   # 当前 ONNX 版本的外置权重
+  tokenizer.json
+```
+
+`download-model` 是唯一会访问网络的命令；正常比较文档仍然完全离线。已存在的文件默认跳过，加 `--force` 才会重新下载。
+
+#### 手动下载（内置命令不可用时）
+
+**方式 B：从已有的便携包复制（离线，推荐）**
 
 如果手边有本项目的便携包，模型已经在里面，不需要联网：
 
@@ -97,7 +130,7 @@ models/
 
 这种方式拿到的是项目测试过的同一份模型，默认 `diffract.toml` 可以直接使用。
 
-**方式 B：从 Hugging Face 下载 ONNX 转换**
+**方式 C：从 Hugging Face 下载 ONNX 转换**
 
 `BAAI/bge-small-zh-v1.5` 的官方仓库主要是 PyTorch 权重；这里使用社区转换好的 ONNX 版本 `onnx-community/bge-small-zh-v1.5-ONNX`。它和 Transformers.js 兼容，输出 `last_hidden_state`，隐藏维度 512，适合本项目的 `pooling = "cls"`。
 
@@ -132,7 +165,7 @@ hf download onnx-community/bge-small-zh-v1.5-ONNX --local-dir models/bge-small-z
 >
 > 如果下载到的是单文件 `model.onnx`（没有 `model.onnx_data`），只复制 `model.onnx` 和 `tokenizer.json` 即可。
 
-**方式 C：浏览器手动下载**
+**方式 D：浏览器手动下载**
 
 打开 [onnx-community/bge-small-zh-v1.5-ONNX 文件页](https://huggingface.co/onnx-community/bge-small-zh-v1.5-ONNX/tree/main/onnx)（国内可用 [hf-mirror 镜像](https://hf-mirror.com/onnx-community/bge-small-zh-v1.5-ONNX/tree/main/onnx)），下载：
 
@@ -140,7 +173,7 @@ hf download onnx-community/bge-small-zh-v1.5-ONNX --local-dir models/bge-small-z
 - `onnx/model.onnx_data`
 - 根目录的 `tokenizer.json`
 
-按方式 B 的第 1 或第 2 种结构放置。
+按方式 C 的第 1 或第 2 种结构放置。
 
 下载后建议用 `--require-semantic` 验证一次，模型不可用时会直接报错而不是静默降级：
 
@@ -183,9 +216,20 @@ diffract.exe --require-semantic --check 旧版.docx 新版.docx
 
 ## 命令行
 
-```
+```text
 diffract.exe [OPTIONS] <OLD> <NEW>
+diffract.exe download-model [OPTIONS]
 ```
+
+`download-model` 只下载语义模型，不需要提供 docx：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--dir <DIR>` | `models` | 模型输出目录 |
+| `--mirror` | 关 | 使用 `https://hf-mirror.com` 镜像 |
+| `--force` | 关 | 覆盖已存在的模型文件 |
+
+比较命令的参数：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -417,6 +461,6 @@ cargo test
 cargo build --release
 ```
 
-产物为 `target/release/diffract.exe`。构建时 `ort` 会下载 ONNX Runtime 静态库；首次构建需要网络，之后可离线。运行时不联网。
+产物为 `target/release/diffract.exe`。构建时会下载 Rust/ONNX Runtime 依赖；首次构建需要网络，之后可离线。正常比较不联网；只有显式执行 `download-model` 时会联网下载模型。
 
 仓库包含 GitHub Actions 工作流（`.github/workflows/ci.yml`）：push / PR 时执行 `cargo fmt --check`、`cargo clippy`、`cargo test` 和 release 构建；推送 `v*` 标签时把 `diffract.exe`、README 与配置文件打成 zip 附加到 GitHub Release。CI 与发布包都不下载、不包含语义模型，使用时按上文“启用语义匹配”自行放置模型文件。
