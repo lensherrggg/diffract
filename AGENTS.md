@@ -27,7 +27,7 @@
 cargo run -- download-model --mirror
 ```
 
-默认下载到 `models/`；指定目录用 `--dir`，覆盖已有文件用 `--force`。只有这个子命令访问网络。
+默认下载到 `models/`；指定目录用 `--dir`，覆盖已有文件用 `--force`。只有这个子命令访问网络。如果已有单文件 `model.onnx`（便携包结构），会自动跳过外置权重 `model.onnx_data`。
 
 ### 离线：从便携包复制
 

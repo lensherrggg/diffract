@@ -244,7 +244,7 @@ struct CompareOutput {
 
 实现：`engine::prepare_semantic` + `model::Embedder`。
 
-模型文件不在 git 中。首次使用先执行 `diffract.exe download-model`（或 `--mirror`），把 `model.onnx`、外置权重 `model.onnx_data` 和 `tokenizer.json` 放到 `models/`；该命令是运行期唯一的联网入口。
+模型文件不在 git 中。首次使用先执行 `diffract.exe download-model`（或 `--mirror`），把 `model.onnx`、外置权重 `model.onnx_data` 和 `tokenizer.json` 放到 `models/`；该命令是运行期唯一的联网入口。如果已有单文件 `model.onnx`（便携包结构），会跳过 `model.onnx_data`，避免重复下载。
 
 1. 只有 `[model].enabled = true` 时尝试加载。
 2. 检查模型和 tokenizer 路径；加载 ONNX Runtime 会话，图优化 Level3，线程数取 CPU 并行度并限制在 1～8。
