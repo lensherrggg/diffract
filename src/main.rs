@@ -25,7 +25,7 @@ use matching::Progress;
     name = "diffract",
     version,
     about = "diffRact：本地 .docx 段落与表格行级版本比较工具",
-    long_about = "比较两个 .docx 的段落与表格行，识别未变、新增、删除、修改、移动、疑似修改六类差异。表格按行级记录，纵向合并单元格按内容展开到覆盖的每一行。默认进入 TUI；--check 用于 CI。"
+    long_about = "比较两个 .docx 的段落与表格行，识别未变、新增、删除、修改、移动、疑似修改六类差异。表格按行级记录，纵向合并单元格按内容展开到覆盖的每一行。默认进入 TUI；--check 或 --html/--md 用于 CI 和批处理。"
 )]
 struct Cli {
     /// 旧版本 .docx
@@ -39,6 +39,14 @@ struct Cli {
     /// 非交互模式：输出统计并按 0/1/2 退出
     #[arg(long)]
     check: bool,
+
+    /// 导出 HTML 报告到指定文件（隐含非交互模式）
+    #[arg(long, value_name = "FILE")]
+    html: Option<PathBuf>,
+
+    /// 导出 Markdown 报告到指定文件（隐含非交互模式）
+    #[arg(long, visible_alias = "markdown", value_name = "FILE")]
+    md: Option<PathBuf>,
 
     /// 指定 TOML 配置文件（默认读取工作目录下的 diffract.toml）
     #[arg(short, long, value_name = "FILE")]
@@ -152,7 +160,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         cli.new.display()
     );
 
-    if cli.check {
+    if cli.check || cli.html.is_some() || cli.md.is_some() {
         let mut progress = CheckProgress::new();
         let output = engine::compare_files(&cli.old, &cli.new, &config, &mut |update| {
             progress.update(update)
@@ -165,7 +173,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Err(err);
             }
         };
+        if let Some(path) = cli.html.as_deref() {
+            report::export_html(&output, path)?;
+        }
+        if let Some(path) = cli.md.as_deref() {
+            report::export_markdown(&output, path)?;
+        }
         print!("{}", report::check_report(&output));
+        if let Some(path) = cli.html.as_deref() {
+            println!("HTML 报告：{}", path.display());
+        }
+        if let Some(path) = cli.md.as_deref() {
+            println!("Markdown 报告：{}", path.display());
+        }
         std::io::stdout().flush()?;
         Ok(if output.summary.has_differences() {
             ExitCode::from(1)
@@ -174,7 +194,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         })
     } else {
         if !std::io::stdout().is_terminal() {
-            anyhow::bail!("TUI 需要交互式终端；请在 CI 或管道中使用 --check");
+            anyhow::bail!("TUI 需要交互式终端；请在 CI 或管道中使用 --check 或 --html/--md");
         }
         tui::run(cli.old, cli.new, config)
     }
@@ -222,5 +242,40 @@ impl CheckProgress {
         if self.tty && self.width > 0 {
             eprintln!();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_flags_are_parsed() {
+        let cli = Cli::try_parse_from([
+            "diffract",
+            "old.docx",
+            "new.docx",
+            "--html",
+            "out/report.html",
+            "--md",
+            "out/report.md",
+        ])
+        .unwrap();
+        assert_eq!(cli.html, Some(PathBuf::from("out/report.html")));
+        assert_eq!(cli.md, Some(PathBuf::from("out/report.md")));
+        assert!(!cli.check);
+    }
+
+    #[test]
+    fn markdown_alias_is_accepted() {
+        let cli = Cli::try_parse_from([
+            "diffract",
+            "old.docx",
+            "new.docx",
+            "--markdown",
+            "report.md",
+        ])
+        .unwrap();
+        assert_eq!(cli.md, Some(PathBuf::from("report.md")));
     }
 }

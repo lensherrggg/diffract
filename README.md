@@ -60,6 +60,14 @@ diffract.exe --check 旧版.docx 新版.docx
 diffract.exe --check --no-semantic 旧版.docx 新版.docx
 ```
 
+导出报告（不进入 TUI）：
+
+```bat
+diffract.exe --html 对比报告.html --md 对比报告.md 旧版.docx 新版.docx
+```
+
+`--html` / `--md` 可单独使用或同时使用，会自动创建所在目录；指定任一导出参数即进入非交互模式，退出码与 `--check` 相同。也可以与 `--check` 一起用。
+
 ### 启用语义匹配
 
 源码仓库不包含模型文件（`models/` 已列入 `.gitignore`），需要自行下载 `BAAI/bge-small-zh-v1.5` 的 ONNX 导出和 tokenizer 后放到本地。便携包是在构建时把模型一起打包的，所以解压即可用。
@@ -105,6 +113,8 @@ diffract.exe [OPTIONS] <OLD> <NEW>
 | --- | --- | --- |
 | `<OLD>` `<NEW>` | 必填 | 旧、新版本 .docx |
 | `--check` | 关 | 非交互模式，输出统计并按 0/1/2 退出 |
+| `--html <FILE>` | 关 | 导出 HTML 报告；指定后进入非交互模式 |
+| `--md <FILE>` | 关 | 导出 Markdown 报告（别名 `--markdown`）；指定后进入非交互模式 |
 | `-c, --config <FILE>` | `./diffract.toml` | 指定配置文件；不存在时使用内置默认值 |
 | `--window <N>` | 5 | 候选段落的搜索窗口（前后各 N 段） |
 | `--weight-text <F>` | 0.6 | 文本相似度权重 |
@@ -323,3 +333,5 @@ cargo build --release
 ```
 
 产物为 `target/release/diffract.exe`。构建时 `ort` 会下载 ONNX Runtime 静态库；首次构建需要网络，之后可离线。运行时不联网。
+
+仓库包含 GitHub Actions 工作流（`.github/workflows/ci.yml`）：push / PR 时执行 `cargo fmt --check`、`cargo clippy`、`cargo test` 和 release 构建；推送 `v*` 标签时把 `diffract.exe`、README 与配置文件打成 zip 附加到 GitHub Release。CI 与发布包都不下载、不包含语义模型，使用时按上文“启用语义匹配”自行放置模型文件。
