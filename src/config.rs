@@ -1,0 +1,353 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub similarity: SimilarityConfig,
+    pub model: ModelConfig,
+    pub diff: DiffConfig,
+    pub log: LogConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            similarity: SimilarityConfig::default(),
+            model: ModelConfig::default(),
+            diff: DiffConfig::default(),
+            log: LogConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SimilarityConfig {
+    pub window: usize,
+    pub weight_text: f64,
+    pub weight_semantic: f64,
+    pub threshold_modified: f64,
+    pub threshold_suspected: f64,
+    pub text_candidate_threshold: f64,
+}
+
+impl Default for SimilarityConfig {
+    fn default() -> Self {
+        Self {
+            window: 5,
+            weight_text: 0.6,
+            weight_semantic: 0.4,
+            threshold_modified: 0.75,
+            threshold_suspected: 0.45,
+            text_candidate_threshold: 0.30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lowercase")]
+pub enum Pooling {
+    #[default]
+    Mean,
+    Cls,
+    /// 模型自身已输出 [batch, dim] 池化向量。
+    Model,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelConfig {
+    pub path: Option<PathBuf>,
+    pub tokenizer_path: Option<PathBuf>,
+    pub max_seq_len: usize,
+    pub enabled: bool,
+    /// 为 true 时模型加载失败将直接报错（退出码 2），而不是退化。
+    pub required: bool,
+    pub output_name: String,
+    pub pooling: Pooling,
+    pub dim: usize,
+    pub batch_size: usize,
+    pub input_ids_name: String,
+    pub attention_mask_name: String,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            path: Some(PathBuf::from("models/model.onnx")),
+            tokenizer_path: Some(PathBuf::from("models/tokenizer.json")),
+            max_seq_len: 512,
+            enabled: true,
+            required: false,
+            output_name: "last_hidden_state".to_string(),
+            pooling: Pooling::Mean,
+            dim: 768,
+            batch_size: 8,
+            input_ids_name: "input_ids".to_string(),
+            attention_mask_name: "attention_mask".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiffConfig {
+    pub context_chars: usize,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self { context_chars: 80 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    pub level: String,
+    pub path: Option<PathBuf>,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            path: None,
+        }
+    }
+}
+
+/// CLI 参数覆盖项。`None` 表示不覆盖配置文件。
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    pub window: Option<usize>,
+    pub weight_text: Option<f64>,
+    pub weight_semantic: Option<f64>,
+    pub threshold_modified: Option<f64>,
+    pub threshold_suspected: Option<f64>,
+    pub text_candidate_threshold: Option<f64>,
+    pub model_path: Option<PathBuf>,
+    pub tokenizer_path: Option<PathBuf>,
+    pub max_seq_len: Option<usize>,
+    pub no_semantic: bool,
+    pub require_semantic: bool,
+    pub output_name: Option<String>,
+    pub pooling: Option<Pooling>,
+    pub dim: Option<usize>,
+    pub context_chars: Option<usize>,
+    pub log_path: Option<PathBuf>,
+    pub log_level: Option<String>,
+}
+
+impl Config {
+    pub fn load(explicit_path: Option<&Path>, overrides: &Overrides) -> Result<Self> {
+        let (mut config, base_dir) = match explicit_path {
+            Some(path) => {
+                if !path.exists() {
+                    bail!("配置文件不存在：{}", path.display());
+                }
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
+                let config: Config = toml::from_str(&text)
+                    .with_context(|| format!("配置文件格式错误：{}", path.display()))?;
+                let base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+                (config, base)
+            }
+            None => {
+                let default_path = Path::new("diffract.toml");
+                if default_path.exists() {
+                    let text = std::fs::read_to_string(default_path)
+                        .with_context(|| "读取 diffract.toml 失败")?;
+                    let config: Config =
+                        toml::from_str(&text).with_context(|| "diffract.toml 格式错误")?;
+                    (config, PathBuf::new())
+                } else {
+                    (Config::default(), PathBuf::new())
+                }
+            }
+        };
+
+        config.resolve_relative_paths(&base_dir);
+        config.apply_overrides(overrides);
+        config.normalize_paths();
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn resolve_relative_paths(&mut self, base: &Path) {
+        if base.as_os_str().is_empty() {
+            return;
+        }
+        for path in [
+            &mut self.model.path,
+            &mut self.model.tokenizer_path,
+            &mut self.log.path,
+        ] {
+            if let Some(value) = path {
+                if value.is_relative() {
+                    *value = base.join(&*value);
+                }
+            }
+        }
+    }
+
+    pub fn apply_overrides(&mut self, overrides: &Overrides) {
+        let s = &mut self.similarity;
+        if let Some(v) = overrides.window {
+            s.window = v;
+        }
+        if let Some(v) = overrides.weight_text {
+            s.weight_text = v;
+        }
+        if let Some(v) = overrides.weight_semantic {
+            s.weight_semantic = v;
+        }
+        if let Some(v) = overrides.threshold_modified {
+            s.threshold_modified = v;
+        }
+        if let Some(v) = overrides.threshold_suspected {
+            s.threshold_suspected = v;
+        }
+        if let Some(v) = overrides.text_candidate_threshold {
+            s.text_candidate_threshold = v;
+        }
+
+        let m = &mut self.model;
+        if let Some(v) = &overrides.model_path {
+            m.path = Some(v.clone());
+        }
+        if let Some(v) = &overrides.tokenizer_path {
+            m.tokenizer_path = Some(v.clone());
+        }
+        if let Some(v) = overrides.max_seq_len {
+            m.max_seq_len = v;
+        }
+        if overrides.no_semantic {
+            m.enabled = false;
+            m.required = false;
+        }
+        if overrides.require_semantic {
+            m.enabled = true;
+            m.required = true;
+        }
+        if let Some(v) = &overrides.output_name {
+            m.output_name = v.clone();
+        }
+        if let Some(v) = overrides.pooling {
+            m.pooling = v;
+        }
+        if let Some(v) = overrides.dim {
+            m.dim = v;
+        }
+
+        if let Some(v) = overrides.context_chars {
+            self.diff.context_chars = v;
+        }
+        if let Some(v) = &overrides.log_path {
+            self.log.path = Some(v.clone());
+        }
+        if let Some(v) = &overrides.log_level {
+            self.log.level = v.clone();
+        }
+    }
+
+    fn normalize_paths(&mut self) {
+        if self
+            .model
+            .path
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            self.model.path = None;
+        }
+        if self
+            .model
+            .tokenizer_path
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            self.model.tokenizer_path = None;
+        }
+        if self
+            .log
+            .path
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            self.log.path = None;
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let s = &self.similarity;
+        if s.window == 0 {
+            bail!("配置非法：[similarity].window 必须大于 0");
+        }
+        for (name, value) in [
+            ("weight_text", s.weight_text),
+            ("weight_semantic", s.weight_semantic),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                bail!("配置非法：[similarity].{name} 必须是非负有限数");
+            }
+        }
+        if s.weight_text + s.weight_semantic <= 0.0 {
+            bail!("配置非法：[similarity] 的文本/语义权重不能同时为 0");
+        }
+        for (name, value) in [
+            ("threshold_modified", s.threshold_modified),
+            ("threshold_suspected", s.threshold_suspected),
+            ("text_candidate_threshold", s.text_candidate_threshold),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                bail!("配置非法：[similarity].{name} 必须在 0 到 1 之间");
+            }
+        }
+        if s.threshold_suspected > s.threshold_modified {
+            bail!(
+                "配置非法：threshold_suspected（{}）不能大于 threshold_modified（{}）",
+                s.threshold_suspected,
+                s.threshold_modified
+            );
+        }
+        if self.diff.context_chars == 0 {
+            bail!("配置非法：[diff].context_chars 必须大于 0");
+        }
+        if self.model.enabled {
+            if self.model.max_seq_len < 8 {
+                bail!("配置非法：[model].max_seq_len 不能小于 8");
+            }
+            if self.model.batch_size == 0 {
+                bail!("配置非法：[model].batch_size 必须大于 0");
+            }
+            if self.model.required && self.model.path.is_none() {
+                bail!("配置非法：要求必须启用语义匹配，但未配置 [model].path");
+            }
+            if self.model.output_name.trim().is_empty() {
+                bail!("配置非法：[model].output_name 不能为空");
+            }
+            if self.model.input_ids_name.trim().is_empty()
+                || self.model.attention_mask_name.trim().is_empty()
+            {
+                bail!("配置非法：[model] 的输入名不能为空");
+            }
+        }
+        if self.model.required && !self.model.enabled {
+            bail!("配置非法：[model].required 为 true 时必须同时 enabled = true");
+        }
+        if !matches!(
+            self.log.level.to_ascii_lowercase().as_str(),
+            "off" | "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            bail!(
+                "配置非法：[log].level 只能是 off/error/warn/info/debug/trace，当前为 {}",
+                self.log.level
+            );
+        }
+        Ok(())
+    }
+}

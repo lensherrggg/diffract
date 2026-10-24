@@ -1,0 +1,23 @@
+# diffRact 本地配置：启用 BAAI/bge-small-zh-v1.5（ONNX，512 维）
+# 该模型的措辞改写与原句文本相似度可能低至 0.1 左右，故降低候选门槛并提高语义权重。
+
+[similarity]
+window = 5
+weight_text = 0.4
+weight_semantic = 0.6
+threshold_modified = 0.75
+threshold_suspected = 0.45
+text_candidate_threshold = 0.10
+
+[model]
+path = "models/model.onnx"
+tokenizer_path = "models/tokenizer.json"
+max_seq_len = 512
+enabled = true
+required = false
+output_name = "last_hidden_state"
+# BGE 系列官方推荐 CLS 池化
+pooling = "cls"
+# 0 = 按模型输出自动推断（本模型为 512）
+dim = 0
+batch_size = 8
