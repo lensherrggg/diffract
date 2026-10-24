@@ -32,6 +32,25 @@ enum WorkerMsg {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DetailPanelSpec {
+    pane: DetailPane,
+    title_color: Color,
+    active: bool,
+}
+
+/// 详情两栏的换行行数缓存。换行计算会遍历整段文本，不能在每帧重复做。
+#[derive(Debug, Clone, Copy)]
+struct DetailMetrics {
+    record_id: usize,
+    expanded: bool,
+    old_width: u16,
+    new_width: u16,
+    height: u16,
+    old_max: u16,
+    new_max: u16,
+}
+
 enum State {
     Running {
         stage: String,
@@ -192,6 +211,9 @@ struct App {
     tick: usize,
     started: Instant,
     context_chars: usize,
+    /// 记录列表预览在比较完成时预计算，避免每帧复制所有记录的完整原文。
+    previews: Vec<String>,
+    detail_metrics: Option<DetailMetrics>,
 }
 
 impl App {
@@ -222,6 +244,8 @@ impl App {
             tick: 0,
             started: Instant::now(),
             context_chars,
+            previews: Vec::new(),
+            detail_metrics: None,
         }
     }
 
@@ -242,11 +266,17 @@ impl App {
                 }
             }
             WorkerMsg::Done(output) => {
+                self.previews = output
+                    .records
+                    .iter()
+                    .map(|record| record_preview(record, 120))
+                    .collect();
                 self.state = State::Ready(output);
                 self.selected = 0;
                 self.table_state.select(Some(0));
                 self.focus = Focus::Records;
                 self.reset_detail_scroll();
+                self.detail_metrics = None;
                 self.expanded = false;
                 self.status = Some(StatusMessage {
                     text: "比较完成".to_string(),
@@ -847,12 +877,15 @@ fn draw_ready(frame: &mut Frame, area: Rect, app: &mut App) {
         Color::DarkGray
     });
 
-    let context = 120usize;
     let rows: Vec<Row> = indices
         .iter()
         .map(|index| {
             let record = &output.records[*index];
-            let preview = record_preview(record, context);
+            let preview = app
+                .previews
+                .get(*index)
+                .cloned()
+                .unwrap_or_else(|| record_preview(record, 120));
             Row::new(vec![
                 Span::styled(
                     record.status.label_zh(),
@@ -938,6 +971,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, context_chars: usiz
         );
         return;
     };
+    let record_id = record.id;
 
     let meta_height = if record.note.is_some() { 4 } else { 3 };
     let layout =
@@ -949,29 +983,57 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, context_chars: usiz
 
     let panels = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(layout[1]);
+    let cached = app.detail_metrics.filter(|metrics| {
+        metrics.record_id == record.id
+            && metrics.expanded == app.expanded
+            && metrics.old_width == panels[0].width
+            && metrics.new_width == panels[1].width
+            && metrics.height == panels[0].height
+    });
+    // 只在详情获得焦点时计算完整换行行数；切换记录时不必为不可见滚动条付这笔开销。
+    let compute_metrics = active.is_some() && cached.is_none();
     let (old_lines, new_lines) = comparison_lines(record, app.expanded, context_chars);
     let (old_scroll, old_max) = draw_detail_panel(
         frame,
         panels[0],
-        DetailPane::Old,
-        old_title_color(record.status),
+        DetailPanelSpec {
+            pane: DetailPane::Old,
+            title_color: old_title_color(record.status),
+            active: active == Some(DetailPane::Old),
+        },
         old_lines,
         app.old_scroll,
-        active == Some(DetailPane::Old),
+        cached.map(|metrics| metrics.old_max),
+        compute_metrics,
     );
     let (new_scroll, new_max) = draw_detail_panel(
         frame,
         panels[1],
-        DetailPane::New,
-        new_title_color(record.status),
+        DetailPanelSpec {
+            pane: DetailPane::New,
+            title_color: new_title_color(record.status),
+            active: active == Some(DetailPane::New),
+        },
         new_lines,
         app.new_scroll,
-        active == Some(DetailPane::New),
+        cached.map(|metrics| metrics.new_max),
+        compute_metrics,
     );
     app.old_scroll = old_scroll;
     app.old_max_scroll = old_max;
     app.new_scroll = new_scroll;
     app.new_max_scroll = new_max;
+    if compute_metrics {
+        app.detail_metrics = Some(DetailMetrics {
+            record_id,
+            expanded: app.expanded,
+            old_width: panels[0].width,
+            new_width: panels[1].width,
+            height: panels[0].height,
+            old_max,
+            new_max,
+        });
+    }
 }
 
 fn detail_meta_lines(record: &Record) -> Vec<Line<'static>> {
@@ -1166,20 +1228,20 @@ fn cell_side_lines(
 fn draw_detail_panel(
     frame: &mut Frame,
     area: Rect,
-    pane: DetailPane,
-    title_color: Color,
+    spec: DetailPanelSpec,
     lines: Vec<Line<'static>>,
     scroll: u16,
-    active: bool,
+    known_max: Option<u16>,
+    compute_metrics: bool,
 ) -> (u16, u16) {
-    let title = if active {
-        format!("▸ {}", pane.label())
+    let title = if spec.active {
+        format!("▸ {}", spec.pane.label())
     } else {
-        pane.label().to_string()
+        spec.pane.label().to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if active {
+        .border_style(Style::default().fg(if spec.active {
             Color::Yellow
         } else {
             Color::DarkGray
@@ -1187,17 +1249,23 @@ fn draw_detail_panel(
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(title_color)
+                .fg(spec.title_color)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .block(block);
-    let total_lines = paragraph.line_count(inner.width);
-    let max_scroll = total_lines
-        .saturating_sub(area.height as usize)
-        .min(u16::MAX as usize) as u16;
+    let max_scroll = if let Some(max) = known_max {
+        max
+    } else if compute_metrics {
+        let total_lines = paragraph.line_count(inner.width);
+        total_lines
+            .saturating_sub(area.height as usize)
+            .min(u16::MAX as usize) as u16
+    } else {
+        0
+    };
     let scroll = scroll.min(max_scroll);
     frame.render_widget(paragraph.scroll((scroll, 0)), area);
     (scroll, max_scroll)
@@ -1479,5 +1547,59 @@ mod tests {
         assert!(Filter::All.matches(Status::Unchanged));
         assert!(!Filter::Modified.matches(Status::SuspectedModified));
         assert_eq!(Filter::from_number('3'), Some(Filter::Suspected));
+    }
+
+    #[test]
+    fn detail_metrics_are_only_computed_when_detail_is_focused() {
+        use ratatui::backend::TestBackend;
+
+        let old = "公司应当每年开展一次安全检查。";
+        let new = "公司应当每季度开展一次安全检查。";
+        let output = CompareOutput {
+            old_path: PathBuf::from("old.docx"),
+            new_path: PathBuf::from("new.docx"),
+            old_paragraphs: 1,
+            new_paragraphs: 1,
+            old_tables: 0,
+            new_tables: 0,
+            records: vec![Record {
+                id: 1,
+                status: Status::Modified,
+                old_para_index: Some(1),
+                new_para_index: Some(1),
+                old_text: Some(old.to_string()),
+                new_text: Some(new.to_string()),
+                scores: crate::result::Scores {
+                    text: 0.8,
+                    semantic: None,
+                    total: 0.8,
+                },
+                diff: Some(crate::diff::para_diff(old, new)),
+                row_diff: None,
+                matched_to: Some(1),
+                note: None,
+                table: None,
+                order: 0.0,
+            }],
+            summary: crate::result::Summary {
+                modified: 1,
+                ..Default::default()
+            },
+            semantic: crate::result::SemanticStatus::disabled("测试"),
+            elapsed: std::time::Duration::from_millis(1),
+        };
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.state = State::Ready(Box::new(output));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            app.detail_metrics.is_none(),
+            "记录列表焦点下不应计算详情换行"
+        );
+
+        app.focus = Focus::Detail(DetailPane::Old);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.detail_metrics.is_some(), "进入详情后应缓存两栏换行行数");
     }
 }
