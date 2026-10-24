@@ -329,7 +329,6 @@ TUI 正常退出始终为 0；运行期错误为 2。
 ## 设计文档
 
 - [项目总体设计](docs/design.md)
-- [表格列对齐与单元格级差异](docs/design-table-cell-diff.md)
 
 ## 从源码构建
 

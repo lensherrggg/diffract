@@ -5,8 +5,6 @@
 - 更新日期：2026-10-24
 - 文档范围：整个项目的架构、数据模型、比较算法、输出方式和工程约束
 
-更细的表格列对齐与单元格差异设计见 [design-table-cell-diff.md](design-table-cell-diff.md)。
-
 ## 1. 项目定位
 
 diffRact 是一个完全本地运行的 `.docx` 版本比较工具。它把两份 Word 文档中的正文段落和表格行分别配对，输出六类结果：
@@ -316,7 +314,7 @@ struct CompareOutput {
 
 ### 5.5 表格匹配
 
-实现：`matching::table`。详细列对齐与单元格差异见 [design-table-cell-diff.md](design-table-cell-diff.md)。
+实现：`matching::table`。表格先做表对齐，再做列对齐，最后按行比较并生成单元格差异。
 
 #### 表对齐
 
@@ -358,6 +356,23 @@ struct CompareOutput {
   - 否则 → 疑似修改；
 - 未配对行 → 整行新增/删除；
 - 整表新增/删除 → 一条记录，正文为整表逐行文本。
+
+#### 单元格差异
+
+行配对成功后，`row_cell_changes` 按列对齐结果逐列比较单元格：
+
+1. 取旧表对应列和新表对应列的值并 `trim`；
+2. 两侧相同，或两侧都为空，跳过；
+3. 否则写入 `CellChange { column, old, new, diff }`，空字符串转为 `None`。
+
+列名优先取新表表头，其次旧表表头，最后回退为“第N列”。因此：
+
+- 新增列/删除列表现为一侧为 `None`；
+- 改列名只影响表头单元格；
+- 插列、删列不会导致后续列整体错位；
+- 一行内多处修改仍合并为一条表格记录，但记录内部只列变化单元格。
+
+`engine` 在记录排序后为每个双侧都有值的单元格生成字符级 diff；报告和 TUI 优先渲染 `row_diff`，不再输出整行文本 diff。纵向合并的内容按解析阶段展开到覆盖的每一行，横向合并的占位列内容为空。
 
 ### 5.6 字符级差异
 
@@ -579,5 +594,4 @@ cargo test
 
 ## 14. 相关文档
 
-- [README.md](../README.md)：安装、使用、配置与 CLI 参考；
-- [design-table-cell-diff.md](design-table-cell-diff.md)：表格列对齐与单元格级差异的详细设计。
+- [README.md](../README.md)：安装、使用、配置与 CLI 参考。
