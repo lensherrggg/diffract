@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use pinyin::ToPinyinMulti;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -67,6 +68,8 @@ struct Entry {
     is_dir: bool,
     is_parent: bool,
     modified: Option<SystemTime>,
+    /// 每个可匹配字符的首字母候选；多音字保留全部读音。
+    initials: Vec<Vec<char>>,
 }
 
 impl Entry {
@@ -679,7 +682,7 @@ fn input_line(picker: &Picker, width: usize) -> Line<'static> {
             Style::default().add_modifier(Modifier::REVERSED),
         ));
         spans.push(Span::styled(
-            " 输入文件名筛选，或 / ~ C:\\ 开头输入路径",
+            " 输入文件名、拼音首字母，或 / ~ C:\\ 开头输入路径",
             Style::default().fg(Color::DarkGray),
         ));
     } else {
@@ -795,6 +798,7 @@ fn read_entries(dir: &Path) -> std::result::Result<Vec<Entry>, String> {
             is_dir: true,
             is_parent: true,
             modified: None,
+            initials: Vec::new(),
         });
     }
 
@@ -813,12 +817,14 @@ fn read_entries(dir: &Path) -> std::result::Result<Vec<Entry>, String> {
             .metadata()
             .ok()
             .and_then(|metadata| metadata.modified().ok());
+        let initials = initials_of(&name);
         entries.push(Entry {
             path,
             name,
             is_dir,
             is_parent: false,
             modified,
+            initials,
         });
     }
 
@@ -829,6 +835,73 @@ fn read_entries(dir: &Path) -> std::result::Result<Vec<Entry>, String> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+fn initials_of(name: &str) -> Vec<Vec<char>> {
+    let mut initials = Vec::new();
+    for ch in name.chars() {
+        if let Some(multi) = ch.to_pinyin_multi() {
+            let mut options: Vec<char> = multi
+                .into_iter()
+                .filter_map(|pinyin| pinyin.first_letter().chars().next())
+                .map(|letter| letter.to_ascii_lowercase())
+                .collect();
+            options.sort_unstable();
+            options.dedup();
+            if !options.is_empty() {
+                initials.push(options);
+            }
+        } else if ch.is_ascii_alphanumeric() {
+            initials.push(vec![ch.to_ascii_lowercase()]);
+        }
+    }
+    initials
+}
+
+fn pinyin_matches(initials: &[Vec<char>], query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let mut search_from = 0;
+    for segment in alnum_segments(query) {
+        let Some(start) = find_segment(initials, &segment, search_from) else {
+            return false;
+        };
+        search_from = start + segment.len();
+    }
+    true
+}
+
+fn alnum_segments(query: &str) -> Vec<Vec<char>> {
+    let mut segments: Vec<Vec<char>> = Vec::new();
+    let mut previous_digit = None;
+    for ch in query.chars() {
+        let digit = ch.is_ascii_digit();
+        if previous_digit != Some(digit) {
+            segments.push(Vec::new());
+            previous_digit = Some(digit);
+        }
+        segments.last_mut().unwrap().push(ch);
+    }
+    segments
+}
+
+fn find_segment(initials: &[Vec<char>], segment: &[char], from: usize) -> Option<usize> {
+    let last = initials.len().checked_sub(segment.len())?;
+    if from > last {
+        return None;
+    }
+    (from..=last).find(|&start| {
+        initials[start..start + segment.len()]
+            .iter()
+            .zip(segment)
+            .all(|(options, ch)| options.contains(ch))
+    })
+}
+
+fn is_pinyin_query(needle: &str) -> bool {
+    needle.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && needle.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 fn compute_filtered(
@@ -847,21 +920,29 @@ fn compute_filtered(
     }
 
     let needle = filter.to_lowercase();
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            if entry.is_parent {
-                return needle.is_empty();
+    let pinyin_query = is_pinyin_query(&needle).then_some(needle.as_str());
+    let mut literal = Vec::new();
+    let mut phonetic = Vec::new();
+
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_parent {
+            if needle.is_empty() {
+                literal.push(index);
             }
-            if !show_all && !entry.is_dir && (!is_docx(&entry.name) || entry.name.starts_with("~$"))
-            {
-                return false;
-            }
-            needle.is_empty() || entry.name.to_lowercase().contains(&needle)
-        })
-        .map(|(index, _)| index)
-        .collect()
+            continue;
+        }
+        if !show_all && !entry.is_dir && (!is_docx(&entry.name) || entry.name.starts_with("~$")) {
+            continue;
+        }
+        if needle.is_empty() || entry.name.to_lowercase().contains(&needle) {
+            literal.push(index);
+        } else if pinyin_query.is_some_and(|query| pinyin_matches(&entry.initials, query)) {
+            phonetic.push(index);
+        }
+    }
+
+    literal.extend(phonetic);
+    literal
 }
 
 fn is_docx(name: &str) -> bool {
@@ -1134,6 +1215,7 @@ mod tests {
             is_dir,
             is_parent: false,
             modified: None,
+            initials: initials_of(name),
         }
     }
 
@@ -1259,6 +1341,7 @@ mod tests {
                 is_dir: true,
                 is_parent: true,
                 modified: None,
+                initials: Vec::new(),
             },
             entry("sub", true),
             entry("other", true),
@@ -1266,6 +1349,54 @@ mod tests {
         ];
         let filtered = compute_filtered(&entries, "old", false, None);
         assert_eq!(filtered, vec![3]);
+    }
+
+    #[test]
+    fn pinyin_initials_match_chinese_names() {
+        let initials = initials_of("工作总结");
+        assert_eq!(initials, vec![vec!['g'], vec!['z'], vec!['z'], vec!['j']]);
+        assert!(pinyin_matches(&initials, "gzzj"));
+        assert!(!pinyin_matches(&initials, "gzj"));
+    }
+
+    #[test]
+    fn pinyin_matches_digits_and_multiple_segments() {
+        let initials = initials_of("2023年工作总结");
+        assert!(pinyin_matches(&initials, "gzzj"));
+        assert!(pinyin_matches(&initials, "2023gzzj"));
+        assert!(pinyin_matches(&initials, "2023"));
+    }
+
+    #[test]
+    fn pinyin_accepts_either_reading_of_polyphonic_characters() {
+        let chongqing = initials_of("重庆");
+        assert!(pinyin_matches(&chongqing, "cq"));
+        assert!(pinyin_matches(&chongqing, "zq"));
+
+        let bank = initials_of("银行");
+        assert!(pinyin_matches(&bank, "yh"));
+        assert!(pinyin_matches(&bank, "yx"));
+    }
+
+    #[test]
+    fn pinyin_matching_prefers_literal_hits() {
+        let entries = vec![entry("工作总结.docx", false), entry("zz-gz.docx", false)];
+        let filtered = compute_filtered(&entries, "gz", false, None);
+        assert_eq!(filtered, vec![1, 0]);
+    }
+
+    #[test]
+    fn pinyin_matching_is_skipped_for_mixed_queries() {
+        let entries = vec![entry("工作总结.docx", false)];
+        assert!(compute_filtered(&entries, "gz zj", false, None).is_empty());
+        assert_eq!(compute_filtered(&entries, "总结", false, None), vec![0]);
+        assert_eq!(compute_filtered(&entries, "GZ", false, None), vec![0]);
+    }
+
+    #[test]
+    fn pinyin_matching_applies_to_directories() {
+        let entries = vec![entry("安全监察部", true)];
+        assert_eq!(compute_filtered(&entries, "aqjcb", false, None), vec![0]);
     }
 
     #[test]

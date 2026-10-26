@@ -1,6 +1,6 @@
 [package]
 name = "diffract"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,7 @@ crossterm = "0.29.0"
 jieba-rs = "0.11.0"
 log = { version = "0.4.34", features = ["std"] }
 ort = "2.0.0-rc.15"
+pinyin = { version = "0.11.0", default-features = false, features = ["plain", "heteronym"] }
 quick-xml = "0.42.0"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0.229", features = ["derive"] }

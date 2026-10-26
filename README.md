@@ -15,10 +15,10 @@
 
 ## 便携版
 
-解压 `diffRact-0.2.0-win64.zip` 后目录内容：
+解压 `diffRact-0.3.0-win64.zip` 后目录内容：
 
 ```
-diffRact-0.2.0-win64/
+diffRact-0.3.0-win64/
 ├─ diffract.exe             主程序（命令行名 diffract）
 ├─ MSVCP140.dll             VC++ 运行库（已随包提供）
 ├─ MSVCP140_1.dll
@@ -115,11 +115,11 @@ models/
 
 ```powershell
 # 解压便携包（按实际路径修改）
-Expand-Archive .\dist\diffRact-0.2.0-win64.zip -DestinationPath .\dist\portable
+Expand-Archive .\dist\diffRact-0.3.0-win64.zip -DestinationPath .\dist\portable
 
 # 建好 models 目录并复制
 New-Item -ItemType Directory -Force .\models | Out-Null
-Copy-Item .\dist\portable\diffRact-0.2.0-win64\models\* .\models\ -Force
+Copy-Item .\dist\portable\diffRact-0.3.0-win64\models\* .\models\ -Force
 ```
 
 复制后应得到：
@@ -381,7 +381,15 @@ path = "diffract.log"     # 省略 path 则不写日志
 | `Esc` | 第二步返回第一步；第一步取消并退出 |
 | `Ctrl+C` | 随时退出选择器 |
 
-当前版本使用普通子串筛选，不包含模糊匹配或拼音搜索。
+当前版本使用普通子串筛选，并额外支持纯 ASCII 查询的拼音首字母匹配：
+
+- `gzzj` 命中「工作总结」；
+- `aqjcb` 命中「安全监察部」；
+- `2023gzzj` 命中「2023年工作总结」：数字段和字母段分别连续匹配，段与段之间可以隔着其他字符；
+- 多音字任一读音都算，`cq` / `zq` 都能命中「重庆」，`yh` / `yx` 都能命中「银行」；
+- 字面命中排在拼音命中之前；查询含中文、空格或标点时只做字面筛选。
+
+不做全拼、声调或跨字跳跃匹配。
 
 界面右侧详情为左右两栏，分别显示旧文和新文：修改/疑似记录的两栏带字符级差异标记，新增只在新文栏显示，删除只在旧文栏显示。表格行的修改/疑似记录只列出有变化的单元格，按“列名：旧值 / 新值”逐行展示，未变化的单元格不重复出现。两栏各自独立滚动。列表与详情的宽度比例为 40% / 60%。记录列表的“旧位置 / 新位置”列显示段落序号（`#12`）或表格位置（`表2·3`）。
 
@@ -475,7 +483,7 @@ TUI 正常退出始终为 0；运行期错误为 2。
 - 比较单位是段落和表格行；文字格式（字体、样式、颜色）变化不构成差异。
 - 空段落被忽略，因此纯空行变化不会报告。
 - 大范围重排且缺少完全相同的锚点时，移动识别可能退化为删除加新增。
-- 文件选择器只列当前目录，不递归扫描；名称筛选是普通子串，不支持模糊匹配或拼音检索。
+- 文件选择器只列当前目录，不递归扫描；名称筛选支持子串和拼音首字母连续片段，不做全拼、声调或跨字跳跃匹配。
 
 ## 设计文档
 
