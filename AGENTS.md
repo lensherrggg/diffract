@@ -31,12 +31,12 @@ cargo run -- download-model --mirror
 
 ### 离线：从便携包复制
 
-如果仓库里或手边有 `dist/diffRact-0.1.0-win64.zip`，直接取其中的 `models/`：
+如果仓库里或手边有 `dist/diffRact-0.2.0-win64.zip`，直接取其中的 `models/`：
 
 ```powershell
-Expand-Archive .\dist\diffRact-0.1.0-win64.zip -DestinationPath .\dist\portable
+Expand-Archive .\dist\diffRact-0.2.0-win64.zip -DestinationPath .\dist\portable
 New-Item -ItemType Directory -Force .\models | Out-Null
-Copy-Item .\dist\portable\diffRact-0.1.0-win64\models\* .\models\ -Force
+Copy-Item .\dist\portable\diffRact-0.2.0-win64\models\* .\models\ -Force
 ```
 
 ### 从 Hugging Face 下载

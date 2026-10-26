@@ -1,6 +1,6 @@
 [package]
 name = "diffract"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -18,5 +18,6 @@ similar = "3.2.0"
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 toml = "1.1.8"
 unicode-normalization = "0.1.26"
+unicode-width = "0.2.2"
 ureq = "3.5.0"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }

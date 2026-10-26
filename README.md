@@ -15,10 +15,10 @@
 
 ## 便携版
 
-解压 `diffRact-0.1.0-win64.zip` 后目录内容：
+解压 `diffRact-0.2.0-win64.zip` 后目录内容：
 
 ```
-diffRact-0.1.0-win64/
+diffRact-0.2.0-win64/
 ├─ diffract.exe             主程序（命令行名 diffract）
 ├─ MSVCP140.dll             VC++ 运行库（已随包提供）
 ├─ MSVCP140_1.dll
@@ -43,6 +43,8 @@ diffRact-0.1.0-win64/
 ```bat
 diffract.exe 旧版.docx 新版.docx
 ```
+
+不带参数启动会先进入文件选择器：先选旧版，再选新版；第二步从旧版所在目录开始。只给一个文件时，选择器只补选缺少的那个，同样从已给文件所在目录开始。`--check`、`--html`、`--md` 仍要求两个文件都给。
 
 带路径或空格时加引号：
 
@@ -113,11 +115,11 @@ models/
 
 ```powershell
 # 解压便携包（按实际路径修改）
-Expand-Archive .\dist\diffRact-0.1.0-win64.zip -DestinationPath .\dist\portable
+Expand-Archive .\dist\diffRact-0.2.0-win64.zip -DestinationPath .\dist\portable
 
 # 建好 models 目录并复制
 New-Item -ItemType Directory -Force .\models | Out-Null
-Copy-Item .\dist\portable\diffRact-0.1.0-win64\models\* .\models\ -Force
+Copy-Item .\dist\portable\diffRact-0.2.0-win64\models\* .\models\ -Force
 ```
 
 复制后应得到：
@@ -217,7 +219,7 @@ diffract.exe --require-semantic --check 旧版.docx 新版.docx
 ## 命令行
 
 ```text
-diffract.exe [OPTIONS] <OLD> <NEW>
+diffract.exe [OPTIONS] [OLD] [NEW]
 diffract.exe download-model [OPTIONS]
 ```
 
@@ -233,7 +235,7 @@ diffract.exe download-model [OPTIONS]
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `<OLD>` `<NEW>` | 必填 | 旧、新版本 .docx |
+| `<OLD>` `<NEW>` | 必填 | 旧、新版本 .docx；TUI 模式下可省略，省略时进入文件选择器 |
 | `--check` | 关 | 非交互模式，输出统计并按 0/1/2 退出 |
 | `--html <FILE>` | 关 | 导出 HTML 报告；指定后进入非交互模式 |
 | `--md <FILE>` | 关 | 导出 Markdown 报告（别名 `--markdown`）；指定后进入非交互模式 |
@@ -353,7 +355,33 @@ path = "diffract.log"     # 省略 path 则不写日志
 
 ## TUI 操作
 
-不带 `--check` 时进入全屏界面；要求标准输入输出连接交互式终端。
+不带 `--check` 时进入全屏界面；要求标准输入输出连接交互式终端。两个文件参数都省略时，先进入文件选择器；只给一个文件时只补选缺少的那个。
+
+### 文件选择器
+
+默认列出当前目录下的文件夹和 `.docx`；按 `Ctrl+T` 切换为显示全部文件。非 `.docx` 文件只在浏览时可见，确认时会被拒绝，避免进入比较阶段才报格式错误。第二步标题为“选择新版文件”，初始目录自动设为旧版所在目录，标题区显示已选旧版路径。
+
+输入框同时承担筛选和路径输入：
+
+- 普通文字按文件名做不区分大小写的子串筛选，空格按字面匹配；
+- 以 `/`、`\`、盘符（如 `C:`）开头，或包含路径分隔符时按路径解析：分隔符前的部分用于定位目录，最后一段作为筛选词；`~` 表示用户主目录；
+- 路径模式下的空格属于文件名，不再当作分隔符；
+- 路径不存在或不可读时，在标题区显示原因并保留输入，修改后自动恢复列表。
+
+| 按键 | 作用 |
+| --- | --- |
+| `↑` / `↓`、`PageUp` / `PageDown`、`Ctrl+P` / `Ctrl+N` | 选择条目 |
+| `Enter` | 进入目录 / 确认文件 |
+| `Tab` | 把选中项补全为完整路径，目录会补上分隔符 |
+| `Backspace` | 删除输入；输入为空时返回上级目录 |
+| `←` / `→` | 移动输入光标 |
+| `Home` / `End` | 移动输入光标；输入为空时跳到首项 / 末项 |
+| `Ctrl+U` | 清空输入 |
+| `Ctrl+T` | 切换“仅 .docx” / “全部文件” |
+| `Esc` | 第二步返回第一步；第一步取消并退出 |
+| `Ctrl+C` | 随时退出选择器 |
+
+当前版本使用普通子串筛选，不包含模糊匹配或拼音搜索。
 
 界面右侧详情为左右两栏，分别显示旧文和新文：修改/疑似记录的两栏带字符级差异标记，新增只在新文栏显示，删除只在旧文栏显示。表格行的修改/疑似记录只列出有变化的单元格，按“列名：旧值 / 新值”逐行展示，未变化的单元格不重复出现。两栏各自独立滚动。列表与详情的宽度比例为 40% / 60%。记录列表的“旧位置 / 新位置”列显示段落序号（`#12`）或表格位置（`表2·3`）。
 
@@ -447,6 +475,7 @@ TUI 正常退出始终为 0；运行期错误为 2。
 - 比较单位是段落和表格行；文字格式（字体、样式、颜色）变化不构成差异。
 - 空段落被忽略，因此纯空行变化不会报告。
 - 大范围重排且缺少完全相同的锚点时，移动识别可能退化为删除加新增。
+- 文件选择器只列当前目录，不递归扫描；名称筛选是普通子串，不支持模糊匹配或拼音检索。
 
 ## 设计文档
 

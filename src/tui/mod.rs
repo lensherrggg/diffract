@@ -26,6 +26,8 @@ use crate::matching::Progress;
 use crate::report;
 use crate::result::{CompareOutput, DiffOp, DiffSpan, Record, Status};
 
+mod picker;
+
 enum WorkerMsg {
     Progress(Progress),
     Done(Box<CompareOutput>),
@@ -619,6 +621,29 @@ pub fn run(old: PathBuf, new: PathBuf, config: Config) -> Result<ExitCode> {
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    run_results(&mut terminal, old, new, config)
+}
+
+pub fn run_with_picker(
+    old: Option<PathBuf>,
+    new: Option<PathBuf>,
+    config: Config,
+) -> Result<ExitCode> {
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let Some((old, new)) = picker::pick(&mut terminal, old, new)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    run_results(&mut terminal, old, new, config)
+}
+
+fn run_results(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    old: PathBuf,
+    new: PathBuf,
+    config: Config,
+) -> Result<ExitCode> {
     let ui_old = old.clone();
     let ui_new = new.clone();
     let context_chars = config.diff.context_chars;
@@ -638,9 +663,8 @@ pub fn run(old: PathBuf, new: PathBuf, config: Config) -> Result<ExitCode> {
     });
 
     let mut app = App::new(ui_old, ui_new, context_chars);
-    event_loop(&mut terminal, &mut app, receiver)?;
+    event_loop(terminal, &mut app, receiver)?;
     let fatal = app.fatal;
-    drop(terminal);
     Ok(if fatal {
         ExitCode::from(2)
     } else {

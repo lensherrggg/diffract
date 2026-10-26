@@ -26,7 +26,7 @@ use model::download;
     name = "diffract",
     version,
     about = "diffRact：本地 .docx 段落与表格行级版本比较工具",
-    long_about = "比较两个 .docx 的段落与表格行，识别未变、新增、删除、修改、移动、疑似修改六类差异。表格按行级记录，纵向合并单元格按内容展开到覆盖的每一行。默认进入 TUI；--check 或 --html/--md 用于 CI 和批处理。使用 download-model 子命令可显式下载语义模型（仅该命令联网）。",
+    long_about = "比较两个 .docx 的段落与表格行，识别未变、新增、删除、修改、移动、疑似修改六类差异。表格按行级记录，纵向合并单元格按内容展开到覆盖的每一行。默认进入 TUI；省略文件参数时先进入文件选择器；--check 或 --html/--md 用于 CI 和批处理。使用 download-model 子命令可显式下载语义模型（仅该命令联网）。",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -57,11 +57,11 @@ enum CliCommand {
 
 #[derive(Debug, clap::Args)]
 struct CompareArgs {
-    /// 旧版本 .docx
+    /// 旧版本 .docx（TUI 模式下可省略）
     #[arg(value_name = "OLD")]
     old: Option<PathBuf>,
 
-    /// 新版本 .docx
+    /// 新版本 .docx（TUI 模式下可省略）
     #[arg(value_name = "NEW")]
     new: Option<PathBuf>,
 
@@ -173,8 +173,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 
     let compare = cli.compare;
-    let old = compare.old.context("缺少旧版本 .docx（OLD）")?;
-    let new = compare.new.context("缺少新版本 .docx（NEW）")?;
+    let old = compare.old;
+    let new = compare.new;
     let overrides = Overrides {
         window: compare.window,
         weight_text: compare.weight_text,
@@ -196,9 +196,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
     };
     let config = Config::load(compare.config.as_deref(), &overrides)?;
     logging::init(&config.log)?;
-    log::info!("diffract 启动：{} -> {}", old.display(), new.display());
+    match (&old, &new) {
+        (Some(old), Some(new)) => {
+            log::info!("diffract 启动：{} -> {}", old.display(), new.display());
+        }
+        _ => log::info!("diffract 启动：等待选择对比文件"),
+    }
 
     if compare.check || compare.html.is_some() || compare.md.is_some() {
+        let old = old.context("缺少旧版本 .docx（OLD）")?;
+        let new = new.context("缺少新版本 .docx（NEW）")?;
         let mut progress = CheckProgress::new();
         let output =
             engine::compare_files(&old, &new, &config, &mut |update| progress.update(update));
@@ -233,7 +240,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         if !std::io::stdout().is_terminal() {
             anyhow::bail!("TUI 需要交互式终端；请在 CI 或管道中使用 --check 或 --html/--md");
         }
-        tui::run(old, new, config)
+        match (old, new) {
+            (Some(old), Some(new)) => tui::run(old, new, config),
+            (old, new) => tui::run_with_picker(old, new, config),
+        }
     }
 }
 
@@ -341,6 +351,17 @@ mod tests {
     fn compare_args_do_not_require_paths_when_downloading() {
         let cli = Cli::try_parse_from(["diffract", "download-model"]).unwrap();
         assert!(cli.compare.old.is_none());
+        assert!(cli.compare.new.is_none());
+    }
+
+    #[test]
+    fn tui_mode_allows_a_missing_file_argument() {
+        let cli = Cli::try_parse_from(["diffract"]).unwrap();
+        assert!(cli.compare.old.is_none());
+        assert!(cli.compare.new.is_none());
+
+        let cli = Cli::try_parse_from(["diffract", "old.docx"]).unwrap();
+        assert_eq!(cli.compare.old, Some(PathBuf::from("old.docx")));
         assert!(cli.compare.new.is_none());
     }
 }
