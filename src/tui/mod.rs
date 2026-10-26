@@ -22,11 +22,14 @@ use ratatui::{Frame, Terminal};
 use crate::config::Config;
 use crate::diff::excerpt;
 use crate::engine;
+use crate::engine::DocumentKind;
 use crate::matching::Progress;
 use crate::report;
 use crate::result::{CompareOutput, DiffOp, DiffSpan, Record, Status};
 
+mod entry;
 mod picker;
+mod xlsx;
 
 enum WorkerMsg {
     Progress(Progress),
@@ -618,10 +621,11 @@ impl App {
 }
 
 pub fn run(old: PathBuf, new: PathBuf, config: Config) -> Result<ExitCode> {
+    let kind = DocumentKind::detect(&old, &new)?;
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    run_results(&mut terminal, old, new, config)
+    run_results(&mut terminal, kind, old, new, config)
 }
 
 pub fn run_with_picker(
@@ -632,13 +636,35 @@ pub fn run_with_picker(
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let Some((old, new)) = picker::pick(&mut terminal, old, new)? else {
+    let kind = match (old.as_deref(), new.as_deref()) {
+        (Some(old), Some(new)) => DocumentKind::detect(old, new)?,
+        (Some(path), None) | (None, Some(path)) => DocumentKind::from_path(path)?,
+        (None, None) => match entry::choose_kind(&mut terminal)? {
+            Some(kind) => kind,
+            None => return Ok(ExitCode::SUCCESS),
+        },
+    };
+    let Some((old, new)) = picker::pick(&mut terminal, kind, old, new)? else {
         return Ok(ExitCode::SUCCESS);
     };
-    run_results(&mut terminal, old, new, config)
+    let kind = DocumentKind::detect(&old, &new)?;
+    run_results(&mut terminal, kind, old, new, config)
 }
 
 fn run_results(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    kind: DocumentKind,
+    old: PathBuf,
+    new: PathBuf,
+    config: Config,
+) -> Result<ExitCode> {
+    match kind {
+        DocumentKind::Docx => run_docx_results(terminal, old, new, config),
+        DocumentKind::Xlsx => xlsx::run(terminal, old, new, config),
+    }
+}
+
+fn run_docx_results(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     old: PathBuf,
     new: PathBuf,
@@ -652,7 +678,7 @@ fn run_results(
         let mut progress = |update| {
             let _ = sender.send(WorkerMsg::Progress(update));
         };
-        match engine::compare_files(&old, &new, &config, &mut progress) {
+        match engine::docx::compare(&old, &new, &config, &mut progress) {
             Ok(output) => {
                 let _ = sender.send(WorkerMsg::Done(Box::new(output)));
             }

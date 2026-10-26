@@ -19,7 +19,7 @@ struct PreparedSemantic {
     tables: TableVectors,
 }
 
-pub fn compare_files(
+pub fn compare(
     old_path: &Path,
     new_path: &Path,
     config: &Config,

@@ -13,6 +13,8 @@
   cargo test
   ```
 
+代码入口按引擎分开：`src/engine/mod.rs` 根据扩展名检测 `DocumentKind` 并分发；Word 在 `src/engine/docx.rs`，Excel 在 `src/xlsx/`；TUI 在 `src/tui/`（`entry.rs` 类型选择、`picker.rs` 文件选择、`xlsx.rs` Excel 网格）。`cargo test` 会在 `target/xlsx-test/` 下临时生成最小工作簿测试 Excel 读取与对齐，不需要提交二进制测试文件。
+
 ## 2. 模型不在 git 里
 
 `models/` 已被 `.gitignore` 忽略，克隆代码后不会自动带有语义模型。没有模型时程序仍可运行，但语义匹配会降级为纯文本，并在界面/报告中提示原因。

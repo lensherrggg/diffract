@@ -21,3 +21,15 @@ pooling = "cls"
 # 0 = 按模型输出自动推断（本模型为 512）
 dim = 0
 batch_size = 8
+
+[xlsx]
+# 省略 header_row 时自动识别；0 表示无表头；填 n 固定第 n 行。
+# header_row = 1
+# 有稳定主键时可改为 [1]（A 列）
+key_columns = []
+compare_mode = "value"
+row_window = 10
+col_window = 3
+semantic_enabled = false
+max_iterations = 5
+ignore_empty_rows = true

@@ -10,6 +10,7 @@ pub struct Config {
     pub model: ModelConfig,
     pub diff: DiffConfig,
     pub log: LogConfig,
+    pub xlsx: XlsxConfig,
 }
 
 impl Default for Config {
@@ -19,6 +20,48 @@ impl Default for Config {
             model: ModelConfig::default(),
             diff: DiffConfig::default(),
             log: LogConfig::default(),
+            xlsx: XlsxConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum XlsxCompareMode {
+    #[default]
+    Value,
+    Formula,
+    Both,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct XlsxConfig {
+    /// 1 基表头行。
+    /// `None` 自动识别；`Some(0)` 无表头；`Some(n)` 固定第 n 行。
+    pub header_row: Option<usize>,
+    /// 1 基行键列，例如 [1] 表示 A 列；空表示按整行内容对齐。
+    pub key_columns: Vec<usize>,
+    pub compare_mode: XlsxCompareMode,
+    pub row_window: usize,
+    pub col_window: usize,
+    /// 预留：首版 Excel 比较不加载语义模型。
+    pub semantic_enabled: bool,
+    pub max_iterations: usize,
+    pub ignore_empty_rows: bool,
+}
+
+impl Default for XlsxConfig {
+    fn default() -> Self {
+        Self {
+            header_row: None,
+            key_columns: Vec::new(),
+            compare_mode: XlsxCompareMode::Value,
+            row_window: 10,
+            col_window: 3,
+            semantic_enabled: false,
+            max_iterations: 5,
+            ignore_empty_rows: true,
         }
     }
 }
@@ -347,6 +390,18 @@ impl Config {
                 "配置非法：[log].level 只能是 off/error/warn/info/debug/trace，当前为 {}",
                 self.log.level
             );
+        }
+        if self.xlsx.row_window == 0 {
+            bail!("配置非法：[xlsx].row_window 必须大于 0");
+        }
+        if self.xlsx.col_window == 0 {
+            bail!("配置非法：[xlsx].col_window 必须大于 0");
+        }
+        if self.xlsx.max_iterations == 0 {
+            bail!("配置非法：[xlsx].max_iterations 必须大于 0");
+        }
+        if self.xlsx.key_columns.contains(&0) {
+            bail!("配置非法：[xlsx].key_columns 使用 1 基列号，不能包含 0");
         }
         Ok(())
     }

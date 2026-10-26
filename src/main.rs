@@ -9,6 +9,7 @@ mod normalize;
 mod report;
 mod result;
 mod tui;
+mod xlsx;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -25,8 +26,8 @@ use model::download;
 #[command(
     name = "diffract",
     version,
-    about = "diffRact：本地 .docx 段落与表格行级版本比较工具",
-    long_about = "比较两个 .docx 的段落与表格行，识别未变、新增、删除、修改、移动、疑似修改六类差异。表格按行级记录，纵向合并单元格按内容展开到覆盖的每一行。默认进入 TUI；省略文件参数时先进入文件选择器；--check 或 --html/--md 用于 CI 和批处理。使用 download-model 子命令可显式下载语义模型（仅该命令联网）。",
+    about = "diffRact：本地 .docx / .xlsx 版本比较工具",
+    long_about = "比较两个 .docx 的段落与表格行，或两个 .xlsx/.xlsm 的工作表、行列与单元格，识别未变、新增、删除、修改、移动、疑似修改六类差异。默认进入 TUI；省略文件参数时先选择 Word/Excel 再进入文件选择器；--check 用于 CI 和批处理（Word 还支持 --html/--md）。使用 download-model 子命令可显式下载语义模型（仅该命令联网）。",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -57,11 +58,11 @@ enum CliCommand {
 
 #[derive(Debug, clap::Args)]
 struct CompareArgs {
-    /// 旧版本 .docx（TUI 模式下可省略）
+    /// 旧版本文件（.docx / .xlsx / .xlsm，TUI 模式下可省略）
     #[arg(value_name = "OLD")]
     old: Option<PathBuf>,
 
-    /// 新版本 .docx（TUI 模式下可省略）
+    /// 新版本文件（.docx / .xlsx / .xlsm，TUI 模式下可省略）
     #[arg(value_name = "NEW")]
     new: Option<PathBuf>,
 
@@ -69,11 +70,11 @@ struct CompareArgs {
     #[arg(long)]
     check: bool,
 
-    /// 导出 HTML 报告到指定文件（隐含非交互模式）
+    /// 导出 HTML 报告到指定文件（仅 Word，隐含非交互模式）
     #[arg(long, value_name = "FILE")]
     html: Option<PathBuf>,
 
-    /// 导出 Markdown 报告到指定文件（隐含非交互模式）
+    /// 导出 Markdown 报告到指定文件（仅 Word，隐含非交互模式）
     #[arg(long, visible_alias = "markdown", value_name = "FILE")]
     md: Option<PathBuf>,
 
@@ -204,11 +205,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 
     if compare.check || compare.html.is_some() || compare.md.is_some() {
-        let old = old.context("缺少旧版本 .docx（OLD）")?;
-        let new = new.context("缺少新版本 .docx（NEW）")?;
+        let old = old.context("缺少旧版本文件（OLD）")?;
+        let new = new.context("缺少新版本文件（NEW）")?;
+        let kind = engine::DocumentKind::detect(&old, &new)?;
+        if kind == engine::DocumentKind::Xlsx && (compare.html.is_some() || compare.md.is_some()) {
+            anyhow::bail!("Excel 比较首版只支持 --check 文本报告，暂不支持 --html/--md");
+        }
         let mut progress = CheckProgress::new();
-        let output =
-            engine::compare_files(&old, &new, &config, &mut |update| progress.update(update));
+        let output = engine::compare(kind, &old, &new, &config, &mut |update| {
+            progress.update(update);
+        });
         progress.finish();
         let output = match output {
             Ok(output) => output,
@@ -217,28 +223,39 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Err(err);
             }
         };
-        if let Some(path) = compare.html.as_deref() {
-            report::export_html(&output, path)?;
-        }
-        if let Some(path) = compare.md.as_deref() {
-            report::export_markdown(&output, path)?;
-        }
-        print!("{}", report::check_report(&output));
-        if let Some(path) = compare.html.as_deref() {
-            println!("HTML 报告：{}", path.display());
-        }
-        if let Some(path) = compare.md.as_deref() {
-            println!("Markdown 报告：{}", path.display());
-        }
+        let has_differences = match output {
+            engine::Output::Docx(output) => {
+                if let Some(path) = compare.html.as_deref() {
+                    report::export_html(&output, path)?;
+                }
+                if let Some(path) = compare.md.as_deref() {
+                    report::export_markdown(&output, path)?;
+                }
+                print!("{}", report::check_report(&output));
+                if let Some(path) = compare.html.as_deref() {
+                    println!("HTML 报告：{}", path.display());
+                }
+                if let Some(path) = compare.md.as_deref() {
+                    println!("Markdown 报告：{}", path.display());
+                }
+                output.summary.has_differences()
+            }
+            engine::Output::Xlsx(output) => {
+                print!("{}", xlsx::report::check_report(&output));
+                output.has_differences()
+            }
+        };
         std::io::stdout().flush()?;
-        Ok(if output.summary.has_differences() {
+        Ok(if has_differences {
             ExitCode::from(1)
         } else {
             ExitCode::SUCCESS
         })
     } else {
         if !std::io::stdout().is_terminal() {
-            anyhow::bail!("TUI 需要交互式终端；请在 CI 或管道中使用 --check 或 --html/--md");
+            anyhow::bail!(
+                "TUI 需要交互式终端；请在 CI 或管道中使用 --check（Word 也可用 --html/--md）"
+            );
         }
         match (old, new) {
             (Some(old), Some(new)) => tui::run(old, new, config),

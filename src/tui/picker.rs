@@ -15,6 +15,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthChar;
 
+use crate::engine::DocumentKind;
+
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,10 +26,10 @@ enum Role {
 }
 
 impl Role {
-    fn title(self) -> &'static str {
+    fn title(self, kind: DocumentKind) -> String {
         match self {
-            Role::Old => "选择旧版文件",
-            Role::New => "选择新版文件",
+            Role::Old => format!("选择旧版{}", kind.label_zh()),
+            Role::New => format!("选择新版{}", kind.label_zh()),
         }
     }
 
@@ -115,6 +117,7 @@ enum PickerOutcome {
 
 struct Picker {
     role: Role,
+    kind: DocumentKind,
     context: Option<PathBuf>,
     cwd: PathBuf,
     view_dir: PathBuf,
@@ -133,10 +136,11 @@ struct Picker {
 }
 
 impl Picker {
-    fn new(role: Role, start_dir: PathBuf, context: Option<PathBuf>) -> Self {
+    fn new(role: Role, kind: DocumentKind, start_dir: PathBuf, context: Option<PathBuf>) -> Self {
         let cwd = absolute(start_dir);
         let mut picker = Self {
             role,
+            kind,
             context,
             view_dir: cwd.clone(),
             cwd,
@@ -191,7 +195,8 @@ impl Picker {
             }
         }
 
-        self.filtered = compute_filtered(
+        self.filtered = compute_filtered_kind(
+            self.kind,
             &self.entries,
             &resolved.filter,
             self.show_all,
@@ -352,10 +357,13 @@ impl Picker {
         if is_dir {
             self.navigate(path);
             Action::Stay
-        } else if is_docx(&name) {
+        } else if self.kind.accepts_name(&name) {
             Action::Pick(path)
         } else {
-            self.status = Some("只支持 .docx 文件；Ctrl+T 可显示全部文件".to_string());
+            self.status = Some(format!(
+                "只支持 {} 文件；Ctrl+T 可显示全部文件",
+                self.kind.extensions_label()
+            ));
             Action::Stay
         }
     }
@@ -459,6 +467,7 @@ impl Picker {
 
 pub fn pick(
     terminal: &mut TuiTerminal,
+    kind: DocumentKind,
     old: Option<PathBuf>,
     new: Option<PathBuf>,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
@@ -472,7 +481,7 @@ pub fn pick(
             let start = resume_old_dir
                 .take()
                 .unwrap_or_else(|| start_dir_for(new.as_deref()));
-            match run_picker(terminal, Role::Old, start, new.as_deref())? {
+            match run_picker(terminal, Role::Old, kind, start, new.as_deref())? {
                 PickerOutcome::Picked(path) => old = Some(path),
                 PickerOutcome::Esc | PickerOutcome::Cancel => return Ok(None),
             }
@@ -480,7 +489,7 @@ pub fn pick(
 
         if new.is_none() {
             let start = start_dir_for(old.as_deref());
-            match run_picker(terminal, Role::New, start, old.as_deref())? {
+            match run_picker(terminal, Role::New, kind, start, old.as_deref())? {
                 PickerOutcome::Picked(path) => {
                     new = Some(path);
                     break;
@@ -509,10 +518,11 @@ pub fn pick(
 fn run_picker(
     terminal: &mut TuiTerminal,
     role: Role,
+    kind: DocumentKind,
     start_dir: PathBuf,
     context: Option<&Path>,
 ) -> Result<PickerOutcome> {
-    let mut picker = Picker::new(role, start_dir, context.map(Path::to_path_buf));
+    let mut picker = Picker::new(role, kind, start_dir, context.map(Path::to_path_buf));
     loop {
         terminal.draw(|frame| draw_picker(frame, &mut picker))?;
         let Event::Key(key) = event::read()? else {
@@ -545,7 +555,7 @@ fn draw_picker_header(frame: &mut Frame, area: Rect, picker: &Picker) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(format!(
             " {} · {} ",
-            picker.role.title(),
+            picker.role.title(picker.kind),
             picker.role.step()
         ));
     let inner = block.inner(area);
@@ -573,7 +583,7 @@ fn draw_picker_header(frame: &mut Frame, area: Rect, picker: &Picker) {
         ]),
         None => Line::from(vec![
             Span::styled("范围  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(range_label(picker.show_all)),
+            Span::raw(range_label(picker.show_all, picker.kind)),
         ]),
     });
     lines.push(input_line(picker, width));
@@ -591,7 +601,7 @@ fn draw_picker_header(frame: &mut Frame, area: Rect, picker: &Picker) {
         let mut text = format!(
             "模式  {} · {}",
             picker.mode.label(),
-            range_label(picker.show_all)
+            range_label(picker.show_all, picker.kind)
         );
         if picker.direct_file.is_some() {
             text.push_str(" · 已定位到输入的路径");
@@ -622,9 +632,9 @@ fn draw_picker_list(frame: &mut Frame, area: Rect, picker: &mut Picker) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(if picker.show_all {
-            "文件 · 全部"
+            "文件 · 全部".to_string()
         } else {
-            "文件 · .docx"
+            format!("文件 · {}", picker.kind.extensions_label())
         });
     let table = Table::new(
         rows,
@@ -655,7 +665,7 @@ fn draw_picker_footer(frame: &mut Frame, area: Rect, picker: &Picker) {
     let count = format!(
         "共 {} 项 · {} · {}",
         picker.filtered.len(),
-        range_label(picker.show_all),
+        range_label(picker.show_all, picker.kind),
         if picker.mode == Mode::Path {
             "路径模式"
         } else {
@@ -776,11 +786,11 @@ fn absolute(path: PathBuf) -> PathBuf {
     cwd.join(path)
 }
 
-fn range_label(show_all: bool) -> &'static str {
+fn range_label(show_all: bool, kind: DocumentKind) -> String {
     if show_all {
-        "显示全部文件（Ctrl+T 只看 .docx）"
+        format!("显示全部文件（Ctrl+T 只看 {}）", kind.extensions_label())
     } else {
-        "仅显示 .docx（Ctrl+T 显示全部）"
+        format!("仅显示 {}（Ctrl+T 显示全部）", kind.extensions_label())
     }
 }
 
@@ -904,7 +914,8 @@ fn is_pinyin_query(needle: &str) -> bool {
         && needle.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
-fn compute_filtered(
+fn compute_filtered_kind(
+    kind: DocumentKind,
     entries: &[Entry],
     filter: &str,
     show_all: bool,
@@ -931,7 +942,10 @@ fn compute_filtered(
             }
             continue;
         }
-        if !show_all && !entry.is_dir && (!is_docx(&entry.name) || entry.name.starts_with("~$")) {
+        if !show_all
+            && !entry.is_dir
+            && (!kind.accepts_name(&entry.name) || entry.name.starts_with("~$"))
+        {
             continue;
         }
         if needle.is_empty() || entry.name.to_lowercase().contains(&needle) {
@@ -945,9 +959,14 @@ fn compute_filtered(
     literal
 }
 
-fn is_docx(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("docx"))
+#[cfg(test)]
+fn compute_filtered(
+    entries: &[Entry],
+    filter: &str,
+    show_all: bool,
+    direct_file: Option<&Path>,
+) -> Vec<usize> {
+    compute_filtered_kind(DocumentKind::Docx, entries, filter, show_all, direct_file)
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -1400,6 +1419,18 @@ mod tests {
     }
 
     #[test]
+    fn xlsx_mode_keeps_workbooks_and_hides_docx() {
+        let entries = vec![
+            entry("sub", true),
+            entry("台账.xlsx", false),
+            entry("台账.xlsm", false),
+            entry("报告.docx", false),
+        ];
+        let filtered = compute_filtered_kind(DocumentKind::Xlsx, &entries, "", false, None);
+        assert_eq!(filtered, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn direct_file_wins_over_the_docx_filter() {
         let base = std::path::Path::new("D:/work");
         let entries = vec![entry("a.docx", false), entry("b.txt", false)];
@@ -1416,7 +1447,7 @@ mod tests {
         fs::write(dir.join("notes.txt"), b"x").unwrap();
         fs::create_dir(dir.join("sub")).unwrap();
 
-        let mut picker = Picker::new(Role::Old, dir.clone(), None);
+        let mut picker = Picker::new(Role::Old, DocumentKind::Docx, dir.clone(), None);
         assert!(
             picker
                 .filtered
@@ -1452,7 +1483,7 @@ mod tests {
     fn picker_blocks_non_docx_files() {
         let dir = temp_dir("block");
         fs::write(dir.join("notes.txt"), b"x").unwrap();
-        let mut picker = Picker::new(Role::Old, dir, None);
+        let mut picker = Picker::new(Role::Old, DocumentKind::Docx, dir, None);
 
         assert!(!picker.show_all);
         picker.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));

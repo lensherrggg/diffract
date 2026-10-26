@@ -28,6 +28,20 @@ attention_mask_name = "attention_mask"
 [diff]
 context_chars = 80
 
+[xlsx]
+# 省略 header_row 时自动识别；0 表示无表头；填 n 固定第 n 行。
+# header_row = 1
+# 1 基行键列，例如 [1] 表示 A 列；空表示按整行内容对齐。
+key_columns = []
+# value / formula / both
+compare_mode = "value"
+row_window = 10
+col_window = 3
+# 首版 Excel 引擎不加载语义模型。
+semantic_enabled = false
+max_iterations = 5
+ignore_empty_rows = true
+
 [log]
 level = "info"
 # 省略 path 或注释掉下一行则不写日志。
