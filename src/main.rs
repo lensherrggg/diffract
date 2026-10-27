@@ -78,7 +78,7 @@ struct CompareArgs {
     #[arg(long, visible_alias = "markdown", value_name = "FILE")]
     md: Option<PathBuf>,
 
-    /// 指定 TOML 配置文件（默认读取工作目录下的 diffract.toml）
+    /// 指定 TOML 配置文件（默认查找工作目录或程序所在目录）
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 

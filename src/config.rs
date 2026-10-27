@@ -186,6 +186,35 @@ pub struct Overrides {
     pub log_level: Option<String>,
 }
 
+fn read_config_file(path: &Path) -> Result<(Config, PathBuf)> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
+    let config: Config =
+        toml::from_str(&text).with_context(|| format!("配置文件格式错误：{}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    Ok((config, base))
+}
+
+/// 当前目录优先，其次回退到 exe 所在目录，便于把程序加入 PATH 后从任意目录启动。
+fn default_config_path() -> Option<PathBuf> {
+    let local = PathBuf::from("diffract.toml");
+    let bundled = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join("diffract.toml");
+    pick_config(&local, &bundled)
+}
+
+fn pick_config(local: &Path, bundled: &Path) -> Option<PathBuf> {
+    if local.is_file() {
+        Some(local.to_path_buf())
+    } else if bundled.is_file() {
+        Some(bundled.to_path_buf())
+    } else {
+        None
+    }
+}
+
 impl Config {
     pub fn load(explicit_path: Option<&Path>, overrides: &Overrides) -> Result<Self> {
         let (mut config, base_dir) = match explicit_path {
@@ -193,25 +222,12 @@ impl Config {
                 if !path.exists() {
                     bail!("配置文件不存在：{}", path.display());
                 }
-                let text = std::fs::read_to_string(path)
-                    .with_context(|| format!("读取配置文件失败：{}", path.display()))?;
-                let config: Config = toml::from_str(&text)
-                    .with_context(|| format!("配置文件格式错误：{}", path.display()))?;
-                let base = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-                (config, base)
+                read_config_file(path)?
             }
-            None => {
-                let default_path = Path::new("diffract.toml");
-                if default_path.exists() {
-                    let text = std::fs::read_to_string(default_path)
-                        .with_context(|| "读取 diffract.toml 失败")?;
-                    let config: Config =
-                        toml::from_str(&text).with_context(|| "diffract.toml 格式错误")?;
-                    (config, PathBuf::new())
-                } else {
-                    (Config::default(), PathBuf::new())
-                }
-            }
+            None => match default_config_path() {
+                Some(path) => read_config_file(&path)?,
+                None => (Config::default(), PathBuf::new()),
+            },
         };
 
         config.resolve_relative_paths(&base_dir);
@@ -404,5 +420,75 @@ impl Config {
             bail!("配置非法：[xlsx].key_columns 使用 1 基列号，不能包含 0");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("config-tests")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn prefers_working_directory_config() {
+        let root = temp_root("prefer-cwd");
+        let cwd = root.join("cwd");
+        let exe = root.join("exe");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&exe).unwrap();
+        fs::write(cwd.join("diffract.toml"), "[diff]\ncontext_chars = 12\n").unwrap();
+        fs::write(exe.join("diffract.toml"), "[diff]\ncontext_chars = 34\n").unwrap();
+
+        let picked = pick_config(&cwd.join("diffract.toml"), &exe.join("diffract.toml"));
+        assert_eq!(picked, Some(cwd.join("diffract.toml")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn falls_back_to_exe_directory_config() {
+        let root = temp_root("fallback-exe");
+        let cwd = root.join("cwd");
+        let exe = root.join("exe");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&exe).unwrap();
+        let bundled = exe.join("diffract.toml");
+        fs::write(&bundled, "[diff]\ncontext_chars = 34\n").unwrap();
+
+        let picked = pick_config(&cwd.join("diffract.toml"), &bundled);
+        assert_eq!(picked, Some(bundled.clone()));
+
+        let (mut config, base) = read_config_file(&bundled).unwrap();
+        assert_eq!(base, exe);
+        config.resolve_relative_paths(&base);
+        assert_eq!(
+            config.model.path,
+            Some(exe.join("models").join("model.onnx"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn returns_none_without_any_config() {
+        let root = temp_root("no-config");
+        let cwd = root.join("cwd");
+        let exe = root.join("exe");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&exe).unwrap();
+
+        assert_eq!(
+            pick_config(&cwd.join("diffract.toml"), &exe.join("diffract.toml")),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

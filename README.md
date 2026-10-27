@@ -34,7 +34,7 @@ diffRact-0.3.0-win64/
 └─ README.md
 ```
 
-支持 Windows 10/11 x64，无需安装。删除或改名 `models/` 后，程序自动退化为纯文本匹配，并在界面和报告中明确提示。
+支持 Windows 10/11 x64，无需安装。删除或改名 `models/` 后，程序自动退化为纯文本匹配，并在界面和报告中明确提示。把 `diffract.exe` 加入 PATH 后，从任意目录启动时，如果当前目录没有 `diffract.toml`，程序会回退读取 exe 同目录的配置和 `models/`。
 
 ### 快速开始
 
@@ -204,7 +204,7 @@ diffract.exe --require-semantic --check 旧版.docx 新版.docx
    batch_size = 8
    ```
 
-   相对路径的基准：默认读取工作目录下的 `diffract.toml`，路径相对工作目录；用 `-c` 指定配置文件时，路径相对该配置文件所在目录。
+   相对路径的基准：默认先查当前工作目录下的 `diffract.toml`，没有则查程序所在目录；路径按实际找到的配置文件所在目录解析。用 `-c` 指定配置文件时，路径相对该配置文件所在目录。
 
 3. 也可以不改配置文件，直接用命令行覆盖：
 
@@ -240,7 +240,7 @@ diffract.exe download-model [OPTIONS]
 | `--check` | 关 | 非交互模式，输出统计并按 0/1/2 退出；Word 和 Excel 都支持 |
 | `--html <FILE>` | 关 | 导出 HTML 报告（仅 Word）；指定后进入非交互模式 |
 | `--md <FILE>` | 关 | 导出 Markdown 报告（仅 Word，别名 `--markdown`）；指定后进入非交互模式 |
-| `-c, --config <FILE>` | `./diffract.toml` | 指定配置文件；不存在时使用内置默认值 |
+| `-c, --config <FILE>` | 工作目录或程序目录的 `diffract.toml` | 指定配置文件；不存在时使用内置默认值 |
 | `--window <N>` | 5 | 候选段落的搜索窗口（前后各 N 段） |
 | `--weight-text <F>` | 0.6 | 文本相似度权重 |
 | `--weight-semantic <F>` | 0.4 | 语义相似度权重 |
@@ -267,9 +267,10 @@ diffract.exe download-model [OPTIONS]
 
 1. `-c/--config` 指定的文件；
 2. 当前工作目录下的 `diffract.toml`；
-3. 内置默认值。
+3. 程序所在目录下的 `diffract.toml`；
+4. 内置默认值。
 
-配置文件中的相对路径按配置文件所在目录解析；没有配置文件时按当前工作目录解析。模板如下：
+配置文件中的相对路径按实际加载的配置文件所在目录解析；没有任何配置文件时按当前工作目录解析。这样把程序加入 PATH 后，从任意目录启动也能用上程序自带的 `models/`。模板如下：
 
 ```toml
 [similarity]
