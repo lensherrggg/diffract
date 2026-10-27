@@ -13,6 +13,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -179,6 +180,15 @@ enum ViewMode {
     Table,
 }
 
+/// 最上层的浮层类型；开、关或互相切换时都要强制重绘一帧空白格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    Help,
+    Dialog,
+    TableDetail,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Records,
@@ -289,6 +299,8 @@ struct App {
     table_detail_scroll: u16,
     table_detail_max: u16,
     table_detail_page: u16,
+    /// 上一帧最上层的浮层，用来在浮层开合时强制重绘空白格。
+    last_overlay: Overlay,
 }
 
 impl App {
@@ -342,6 +354,7 @@ impl App {
             table_detail_scroll: 0,
             table_detail_max: 0,
             table_detail_page: 1,
+            last_overlay: Overlay::None,
         }
     }
 
@@ -586,6 +599,19 @@ impl App {
         if self.view != ViewMode::Table {
             self.table_view = None;
             self.table_detail = None;
+        }
+    }
+
+    /// 当前最上层的浮层。`draw` 用它判断浮层是否刚开合过。
+    fn overlay(&self) -> Overlay {
+        if self.help {
+            Overlay::Help
+        } else if self.dialog.is_some() {
+            Overlay::Dialog
+        } else if self.table_detail.is_some() {
+            Overlay::TableDetail
+        } else {
+            Overlay::None
         }
     }
 
@@ -1164,6 +1190,33 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(dialog) = &app.dialog {
         draw_dialog(frame, area, dialog);
+    }
+
+    let overlay = app.overlay();
+    if overlay != app.last_overlay {
+        force_repaint_blank_cells(frame);
+        app.last_overlay = overlay;
+    }
+}
+
+/// 浮层开合时强制重发所有空白单元格。
+///
+/// 宽字符的第二列会继承删除线/下划线，但缓冲区把它记成普通空格；下一帧若这里仍是空格，
+/// 差分就不会重发，终端上会残留红绿线条。把空白格标成 `AlwaysUpdate` 可强制覆盖一次。
+/// 宽字符右侧的跟随列必须跳过，否则会在错位的位置补空格、撕开汉字。
+fn force_repaint_blank_cells(frame: &mut Frame) {
+    let area = frame.area();
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if x > 0 && UnicodeWidthStr::width(buffer[(x - 1, y)].symbol()) > 1 {
+                continue;
+            }
+            let cell = &mut buffer[(x, y)];
+            if cell.symbol().trim().is_empty() {
+                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
     }
 }
 
@@ -3760,6 +3813,76 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('q')));
         assert!(app.quit, "回到表格视图后 q 仍退出程序");
+    }
+
+    #[test]
+    fn overlay_transitions_force_blank_cells_to_repaint() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output_with_table())));
+        app.view = ViewMode::Table;
+        app.table_view = Some(long_detail_table());
+        app.reset_table_navigation();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        let first = terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.last_overlay, Overlay::None);
+        assert_eq!(
+            forced_blank_cells(first.buffer),
+            0,
+            "浮层没变化时不应强制重绘"
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        let opened = terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.last_overlay, Overlay::TableDetail);
+        assert!(forced_blank_cells(opened.buffer) > 0);
+
+        let steady = terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            forced_blank_cells(steady.buffer),
+            0,
+            "浮层保持打开时只强制一帧"
+        );
+
+        app.handle_key(key(KeyCode::Char('q')));
+        let closed = terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.last_overlay, Overlay::None);
+        assert!(
+            forced_blank_cells(closed.buffer) > 0,
+            "关闭行详情应强制重绘空白格，清掉宽字符尾列的彩色线条"
+        );
+
+        app.handle_key(key(KeyCode::Char('?')));
+        let help = terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.last_overlay, Overlay::Help);
+        assert!(forced_blank_cells(help.buffer) > 0);
+
+        app.handle_key(key(KeyCode::Char('?')));
+        let back = terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.last_overlay, Overlay::None);
+        assert!(
+            forced_blank_cells(back.buffer) > 0,
+            "关闭帮助也应强制重绘空白格"
+        );
+    }
+
+    fn forced_blank_cells(buffer: &ratatui::buffer::Buffer) -> usize {
+        let mut count = 0;
+        for y in buffer.area.top()..buffer.area.bottom() {
+            for x in buffer.area.left()..buffer.area.right() {
+                let cell = &buffer[(x, y)];
+                let after_wide = x > 0 && UnicodeWidthStr::width(buffer[(x - 1, y)].symbol()) > 1;
+                if !after_wide
+                    && cell.symbol().trim().is_empty()
+                    && cell.diff_option == CellDiffOption::AlwaysUpdate
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     #[test]
