@@ -647,6 +647,7 @@ mod tests {
             old_tables: 0,
             new_tables: 0,
             records: vec![record],
+            tables: Vec::new(),
             summary: Summary {
                 added: 1,
                 ..Summary::default()
@@ -701,6 +702,7 @@ mod tests {
             old_tables: 1,
             new_tables: 1,
             records: vec![record],
+            tables: Vec::new(),
             summary: Summary {
                 modified: 1,
                 ..Summary::default()

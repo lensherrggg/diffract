@@ -228,6 +228,72 @@ impl Summary {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridColumnKind {
+    Unchanged,
+    Added,
+    Removed,
+}
+
+#[derive(Debug, Clone)]
+pub struct GridColumn {
+    pub label: String,
+    /// 旧表同名/同位置列的原始表头，用于显示列改名。
+    pub old_label: Option<String>,
+    pub old_index: Option<usize>,
+    pub new_index: Option<usize>,
+    pub kind: GridColumnKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridCellKind {
+    Unchanged,
+    Added,
+    Removed,
+    Modified,
+}
+
+#[derive(Debug, Clone)]
+pub struct GridCell {
+    pub old: Option<String>,
+    pub new: Option<String>,
+    pub diff: Option<ParaDiff>,
+    pub kind: GridCellKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridRowKind {
+    Unchanged,
+    Added,
+    Removed,
+    Modified,
+    SuspectedModified,
+    MovedFrom,
+    MovedTo,
+}
+
+#[derive(Debug, Clone)]
+pub struct GridRow {
+    pub kind: GridRowKind,
+    pub old_row: Option<usize>,
+    pub new_row: Option<usize>,
+    pub cells: Vec<GridCell>,
+    pub note: Option<String>,
+}
+
+/// Word 表格的整表对齐结果，供修订视图按真实表格渲染。
+#[derive(Debug, Clone)]
+pub struct TableGrid {
+    pub table: usize,
+    pub caption: Option<String>,
+    pub order: f64,
+    pub columns: Vec<GridColumn>,
+    pub rows: Vec<GridRow>,
+    pub summary: Summary,
+    /// 整表未配对时记录新增/删除；此时 columns/rows 来自单侧表格。
+    pub whole: Option<Status>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SemanticStatus {
     pub enabled: bool,
@@ -286,6 +352,7 @@ pub struct CompareOutput {
     pub old_tables: usize,
     pub new_tables: usize,
     pub records: Vec<Record>,
+    pub tables: Vec<TableGrid>,
     pub summary: Summary,
     pub semantic: SemanticStatus,
     pub elapsed: Duration,

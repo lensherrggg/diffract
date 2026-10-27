@@ -1,9 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::{Config, SimilarityConfig};
+use crate::diff::para_diff;
 use crate::docx::{Table, TableRow};
 use crate::normalize::normalize_for_match;
-use crate::result::{CellChange, Record, Scores, Status, TableLocation};
+use crate::result::{
+    CellChange, GridCell, GridCellKind, GridColumn, GridColumnKind, GridRow, GridRowKind, Record,
+    Scores, Status, Summary, TableGrid, TableLocation,
+};
 
 use super::text_sim::{TextFeatures, cosine, text_similarity};
 
@@ -31,33 +35,38 @@ pub fn match_tables(
     new: &[Table],
     config: &Config,
     semantic: Option<&TableVectors>,
-) -> Vec<Record> {
+) -> (Vec<Record>, Vec<TableGrid>) {
     let mut records = Vec::new();
+    let mut grids = Vec::new();
     let mut old_used = vec![false; old.len()];
     let mut new_used = vec![false; new.len()];
 
     for (old_index, new_index) in align_tables(old, new) {
         old_used[old_index] = true;
         new_used[new_index] = true;
-        records.extend(compare_table_pair(
+        let (pair_records, grid) = compare_table_pair(
             &old[old_index],
             &new[new_index],
             config,
             semantic.map(|vectors| vectors.old[old_index].as_slice()),
             semantic.map(|vectors| vectors.new[new_index].as_slice()),
-        ));
+        );
+        records.extend(pair_records);
+        grids.push(grid);
     }
     for (index, table) in old.iter().enumerate() {
         if !old_used[index] {
             records.push(whole_table_record(table, false));
+            grids.push(whole_table_grid(table, false));
         }
     }
     for (index, table) in new.iter().enumerate() {
         if !new_used[index] {
             records.push(whole_table_record(table, true));
+            grids.push(whole_table_grid(table, true));
         }
     }
-    records
+    (records, grids)
 }
 
 fn align_tables(old: &[Table], new: &[Table]) -> Vec<(usize, usize)> {
@@ -275,6 +284,7 @@ struct ColumnPair {
     old: Option<usize>,
     new: Option<usize>,
     label: String,
+    old_label: Option<String>,
 }
 
 struct ColumnAlignment {
@@ -393,10 +403,15 @@ fn align_columns(old: &Table, new: &Table) -> ColumnAlignment {
             })
             .cloned()
             .unwrap_or_else(|| format!("第{}列", new_column + 1));
+        let old_label = old_column
+            .and_then(|column| old_texts.get(column))
+            .filter(|text| !text.is_empty())
+            .cloned();
         pairs.push(ColumnPair {
             old: old_column,
             new: Some(new_column),
             label,
+            old_label,
         });
     }
     for (old_column, new_column) in new_for_old.iter().enumerate() {
@@ -409,6 +424,7 @@ fn align_columns(old: &Table, new: &Table) -> ColumnAlignment {
             pairs.push(ColumnPair {
                 old: Some(old_column),
                 new: None,
+                old_label: Some(label.clone()),
                 label,
             });
         }
@@ -933,7 +949,7 @@ fn compare_table_pair(
     config: &Config,
     old_vectors: Option<&[Vec<f32>]>,
     new_vectors: Option<&[Vec<f32>]>,
-) -> Vec<Record> {
+) -> (Vec<Record>, TableGrid) {
     let alignment = align_columns(old, new);
     let key_columns = choose_key_columns(&alignment, old, new);
     let old_rows = build_view(old, Side::Old, &alignment, key_columns.map(|pair| pair.0));
@@ -950,7 +966,7 @@ fn compare_table_pair(
     let caption = new.caption.clone().or_else(|| old.caption.clone());
     let mut records = Vec::new();
 
-    for pair in pairs {
+    for pair in &pairs {
         let old_row = &old_rows[pair.old];
         let new_row = &new_rows[pair.new];
         if old_row.normalized == new_row.normalized {
@@ -1033,7 +1049,7 @@ fn compare_table_pair(
         });
     }
 
-    for index in removed_rows {
+    for &index in &removed_rows {
         let row = &old_rows[index];
         records.push(Record {
             id: 0,
@@ -1057,7 +1073,7 @@ fn compare_table_pair(
         });
     }
 
-    for index in added_rows {
+    for &index in &added_rows {
         let row = &new_rows[index];
         records.push(Record {
             id: 0,
@@ -1081,7 +1097,344 @@ fn compare_table_pair(
         });
     }
 
-    records
+    let grid = build_grid(
+        GridSource {
+            old,
+            new,
+            alignment: &alignment,
+            old_rows: &old_rows,
+            new_rows: &new_rows,
+            pairs: &pairs,
+            removed_rows: &removed_rows,
+            added_rows: &added_rows,
+        },
+        config,
+        table_number,
+        caption,
+    );
+    (records, grid)
+}
+
+struct GridSource<'a> {
+    old: &'a Table,
+    new: &'a Table,
+    alignment: &'a ColumnAlignment,
+    old_rows: &'a [RowView],
+    new_rows: &'a [RowView],
+    pairs: &'a [RowPair],
+    removed_rows: &'a [usize],
+    added_rows: &'a [usize],
+}
+
+fn build_grid(
+    source: GridSource<'_>,
+    config: &Config,
+    table_number: usize,
+    caption: Option<String>,
+) -> TableGrid {
+    let GridSource {
+        old,
+        new,
+        alignment,
+        old_rows,
+        new_rows,
+        pairs,
+        removed_rows,
+        added_rows,
+    } = source;
+    let columns = build_columns(alignment);
+    let old_header = header_row(old, &alignment.old_ignored);
+    let new_header = header_row(new, &alignment.new_ignored);
+    let is_header_pair =
+        |pair: &RowPair| Some(pair.old) == old_header || Some(pair.new) == new_header;
+    let mut pair_indices: Vec<(usize, usize)> = pairs
+        .iter()
+        .filter(|pair| !is_header_pair(pair))
+        .map(|pair| (pair.old, pair.new))
+        .collect();
+    pair_indices.sort_unstable_by_key(|(old_index, _)| *old_index);
+
+    let mut summary = Summary::default();
+    let mut entries: Vec<(f64, GridRow)> = Vec::new();
+
+    for pair in pairs {
+        if is_header_pair(pair) {
+            continue;
+        }
+        let status = grid_pair_status(
+            pair,
+            &old_rows[pair.old],
+            &new_rows[pair.new],
+            &old.rows[pair.old],
+            &new.rows[pair.new],
+            alignment,
+            config,
+        );
+        let (kind, note) = match status {
+            Status::Unchanged => {
+                summary.unchanged += 1;
+                (GridRowKind::Unchanged, None)
+            }
+            Status::Modified => {
+                summary.modified += 1;
+                (
+                    GridRowKind::Modified,
+                    pair.out_of_order.then(|| "行序变化".to_string()),
+                )
+            }
+            Status::SuspectedModified => {
+                summary.suspected_modified += 1;
+                (
+                    GridRowKind::SuspectedModified,
+                    pair.out_of_order.then(|| "行序变化".to_string()),
+                )
+            }
+            Status::Moved => {
+                summary.moved += 1;
+                (
+                    GridRowKind::MovedTo,
+                    Some(format!("移动自旧行 {}", pair.old + 1)),
+                )
+            }
+            Status::Added | Status::Removed => (GridRowKind::Unchanged, None),
+        };
+        let row = GridRow {
+            kind,
+            old_row: Some(old.rows[pair.old].index + 1),
+            new_row: Some(new.rows[pair.new].index + 1),
+            cells: grid_cells_with(&columns, old, new, Some(pair.old), Some(pair.new), kind),
+            note,
+        };
+        entries.push((pair.new as f64, row));
+
+        if kind == GridRowKind::MovedTo {
+            let from = GridRow {
+                kind: GridRowKind::MovedFrom,
+                old_row: Some(old.rows[pair.old].index + 1),
+                new_row: None,
+                cells: grid_cells_with(
+                    &columns,
+                    old,
+                    new,
+                    Some(pair.old),
+                    Some(pair.new),
+                    GridRowKind::MovedFrom,
+                ),
+                note: Some(format!("移动至新行 {}", pair.new + 1)),
+            };
+            entries.push((deletion_order(pair.old, &pair_indices), from));
+        }
+    }
+
+    for &index in removed_rows {
+        if Some(index) == old_header {
+            continue;
+        }
+        summary.removed += 1;
+        entries.push((
+            deletion_order(index, &pair_indices),
+            GridRow {
+                kind: GridRowKind::Removed,
+                old_row: Some(old.rows[index].index + 1),
+                new_row: None,
+                cells: grid_cells_with(&columns, old, new, Some(index), None, GridRowKind::Removed),
+                note: None,
+            },
+        ));
+    }
+
+    for &index in added_rows {
+        if Some(index) == new_header {
+            continue;
+        }
+        summary.added += 1;
+        entries.push((
+            index as f64,
+            GridRow {
+                kind: GridRowKind::Added,
+                old_row: None,
+                new_row: Some(new.rows[index].index + 1),
+                cells: grid_cells_with(&columns, old, new, None, Some(index), GridRowKind::Added),
+                note: None,
+            },
+        ));
+    }
+
+    entries.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| a.1.old_row.cmp(&b.1.old_row))
+            .then_with(|| a.1.new_row.cmp(&b.1.new_row))
+    });
+
+    TableGrid {
+        table: table_number,
+        caption,
+        order: new.anchor as f64 - 0.4,
+        columns,
+        rows: entries.into_iter().map(|(_, row)| row).collect(),
+        summary,
+        whole: None,
+    }
+}
+
+fn build_columns(alignment: &ColumnAlignment) -> Vec<GridColumn> {
+    let mut columns: Vec<GridColumn> = alignment
+        .pairs
+        .iter()
+        .filter(|pair| pair.new.is_some())
+        .map(|pair| GridColumn {
+            label: pair.label.clone(),
+            old_label: pair.old_label.clone(),
+            old_index: pair.old,
+            new_index: pair.new,
+            kind: if pair.old.is_some() {
+                GridColumnKind::Unchanged
+            } else {
+                GridColumnKind::Added
+            },
+        })
+        .collect();
+    for pair in alignment.pairs.iter().filter(|pair| pair.new.is_none()) {
+        let Some(old_index) = pair.old else {
+            continue;
+        };
+        let position = columns
+            .iter()
+            .position(|column| column.old_index.is_some_and(|index| index > old_index))
+            .unwrap_or(columns.len());
+        columns.insert(
+            position,
+            GridColumn {
+                label: pair.label.clone(),
+                old_label: pair.old_label.clone(),
+                old_index: Some(old_index),
+                new_index: None,
+                kind: GridColumnKind::Removed,
+            },
+        );
+    }
+    columns
+}
+
+fn grid_pair_status(
+    pair: &RowPair,
+    old_row: &RowView,
+    new_row: &RowView,
+    old_table_row: &TableRow,
+    new_table_row: &TableRow,
+    alignment: &ColumnAlignment,
+    config: &Config,
+) -> Status {
+    if old_row.normalized == new_row.normalized {
+        return if pair.out_of_order {
+            Status::Moved
+        } else {
+            Status::Unchanged
+        };
+    }
+    if row_cell_changes(old_table_row, new_table_row, alignment).is_empty() {
+        return if pair.out_of_order {
+            Status::Moved
+        } else {
+            Status::Unchanged
+        };
+    }
+    let mostly_equal = mostly_equal_cells(&old_row.cells, &new_row.cells);
+    let confirmed =
+        pair.keyed || pair.scores.total >= config.similarity.threshold_modified || mostly_equal;
+    if confirmed {
+        Status::Modified
+    } else {
+        Status::SuspectedModified
+    }
+}
+
+fn grid_cells_with(
+    columns: &[GridColumn],
+    old: &Table,
+    new: &Table,
+    old_index: Option<usize>,
+    new_index: Option<usize>,
+    row_kind: GridRowKind,
+) -> Vec<GridCell> {
+    columns
+        .iter()
+        .map(|column| {
+            let old_value = cell_value(old, old_index, column.old_index);
+            let new_value = cell_value(new, new_index, column.new_index);
+            match row_kind {
+                GridRowKind::Removed | GridRowKind::MovedFrom => GridCell {
+                    old: old_value,
+                    new: None,
+                    diff: None,
+                    kind: GridCellKind::Removed,
+                },
+                GridRowKind::Added | GridRowKind::MovedTo => GridCell {
+                    old: None,
+                    new: new_value,
+                    diff: None,
+                    kind: GridCellKind::Added,
+                },
+                _ => match (old_value, new_value) {
+                    (Some(old), Some(new)) if old == new => GridCell {
+                        old: Some(old),
+                        new: Some(new),
+                        diff: None,
+                        kind: GridCellKind::Unchanged,
+                    },
+                    (Some(old), Some(new)) => {
+                        let diff = para_diff(&old, &new);
+                        GridCell {
+                            old: Some(old),
+                            new: Some(new),
+                            diff: Some(diff),
+                            kind: GridCellKind::Modified,
+                        }
+                    }
+                    (Some(old), None) => GridCell {
+                        old: Some(old),
+                        new: None,
+                        diff: None,
+                        kind: GridCellKind::Removed,
+                    },
+                    (None, Some(new)) => GridCell {
+                        old: None,
+                        new: Some(new),
+                        diff: None,
+                        kind: GridCellKind::Added,
+                    },
+                    (None, None) => GridCell {
+                        old: None,
+                        new: None,
+                        diff: None,
+                        kind: GridCellKind::Unchanged,
+                    },
+                },
+            }
+        })
+        .collect()
+}
+
+fn cell_value(table: &Table, row: Option<usize>, column: Option<usize>) -> Option<String> {
+    let value = row
+        .and_then(|row| table.rows.get(row))
+        .and_then(|row| column.and_then(|column| row.cells.get(column)))
+        .map(|cell| cell.trim())
+        .filter(|cell| !cell.is_empty())?;
+    Some(value.to_string())
+}
+
+fn deletion_order(old_index: usize, pairs: &[(usize, usize)]) -> f64 {
+    let previous = pairs
+        .iter()
+        .take_while(|(old, _)| *old < old_index)
+        .last()
+        .map(|(_, new)| *new as f64 + 0.5);
+    let next = pairs
+        .iter()
+        .find(|(old, _)| *old > old_index)
+        .map(|(_, new)| *new as f64 - 0.5);
+    previous.or(next).unwrap_or(-0.5)
 }
 
 fn table_move_record(
@@ -1158,6 +1511,110 @@ fn whole_table_record(table: &Table, added: bool) -> Record {
     }
 }
 
+fn whole_table_grid(table: &Table, added: bool) -> TableGrid {
+    let ignored = ordinal_columns(table);
+    let header = header_row(table, &ignored);
+    let headers = header_texts(table, &ignored);
+    let column_count = table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or(0);
+    let columns: Vec<GridColumn> = (0..column_count)
+        .filter(|column| !ignored.get(*column).copied().unwrap_or(false))
+        .map(|column| {
+            let label = headers
+                .get(column)
+                .map(|text| text.trim())
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("第{}列", column + 1));
+            GridColumn {
+                old_label: (!added).then(|| label.clone()),
+                label,
+                old_index: (!added).then_some(column),
+                new_index: added.then_some(column),
+                kind: if added {
+                    GridColumnKind::Added
+                } else {
+                    GridColumnKind::Removed
+                },
+            }
+        })
+        .collect();
+
+    let rows: Vec<GridRow> = table
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != header)
+        .map(|(index, row)| {
+            let cells = columns
+                .iter()
+                .map(|column| {
+                    let column_index = if added {
+                        column.new_index
+                    } else {
+                        column.old_index
+                    };
+                    let value = column_index
+                        .and_then(|column| row.cells.get(column))
+                        .map(|cell| cell.trim())
+                        .filter(|cell| !cell.is_empty())
+                        .map(str::to_string);
+                    if added {
+                        GridCell {
+                            old: None,
+                            new: value,
+                            diff: None,
+                            kind: GridCellKind::Added,
+                        }
+                    } else {
+                        GridCell {
+                            old: value,
+                            new: None,
+                            diff: None,
+                            kind: GridCellKind::Removed,
+                        }
+                    }
+                })
+                .collect();
+            GridRow {
+                kind: if added {
+                    GridRowKind::Added
+                } else {
+                    GridRowKind::Removed
+                },
+                old_row: (!added).then_some(index + 1),
+                new_row: added.then_some(index + 1),
+                cells,
+                note: None,
+            }
+        })
+        .collect();
+
+    let mut summary = Summary::default();
+    if added {
+        summary.added = rows.len();
+    } else {
+        summary.removed = rows.len();
+    }
+    TableGrid {
+        table: table.index + 1,
+        caption: table.caption.clone(),
+        order: table.anchor as f64 - 0.35,
+        columns,
+        rows,
+        summary,
+        whole: Some(if added {
+            Status::Added
+        } else {
+            Status::Removed
+        }),
+    }
+}
+
 fn mostly_equal_cells(old: &[String], new: &[String]) -> bool {
     let aligned = old.len().min(new.len());
     let mut meaningful = 0;
@@ -1224,13 +1681,17 @@ mod tests {
         }
     }
 
-    fn run(old: &Table, new: &Table) -> Vec<Record> {
+    fn run_all(old: &Table, new: &Table) -> (Vec<Record>, Vec<TableGrid>) {
         match_tables(
             std::slice::from_ref(old),
             std::slice::from_ref(new),
             &Config::default(),
             None,
         )
+    }
+
+    fn run(old: &Table, new: &Table) -> Vec<Record> {
+        run_all(old, new).0
     }
 
     fn run_with_vectors(
@@ -1245,6 +1706,7 @@ mod tests {
             config,
             Some(vectors),
         )
+        .0
     }
 
     #[test]
@@ -1303,7 +1765,7 @@ mod tests {
     fn whole_table_added_is_one_record() {
         let existing = table(0, 1, &[&["指标", "值"], &["甲", "1"], &["乙", "2"]]);
         let extra = table(1, 3, &[&["姓名", "部门"], &["丙", "办公室"]]);
-        let records = match_tables(
+        let (records, _) = match_tables(
             std::slice::from_ref(&existing),
             &[existing.clone(), extra],
             &Config::default(),
@@ -1832,5 +2294,196 @@ mod tests {
         assert_eq!(cells[0].column, "备注");
         assert_eq!(cells[0].old.as_deref(), Some("已完成"));
         assert_eq!(cells[0].new, None);
+    }
+
+    #[test]
+    fn grid_includes_unchanged_rows_and_uses_header_as_columns() {
+        let old = table(0, 1, &[&["指标", "值"], &["甲", "1"], &["乙", "2"]]);
+        let new = table(0, 1, &[&["指标", "值"], &["甲", "1"], &["乙", "3"]]);
+        let (_, grids) = run_all(&old, &new);
+        assert_eq!(grids.len(), 1, "{grids:#?}");
+        let grid = &grids[0];
+        assert_eq!(grid.table, 1);
+        assert_eq!(grid.whole, None);
+        assert_eq!(grid.columns.len(), 2);
+        assert_eq!(grid.columns[0].label, "指标");
+        assert_eq!(grid.columns[0].kind, GridColumnKind::Unchanged);
+        assert_eq!(grid.rows.len(), 2, "未变行也要进入网格");
+        assert_eq!(grid.rows[0].kind, GridRowKind::Unchanged);
+        assert_eq!(grid.rows[0].old_row, Some(2));
+        assert_eq!(grid.rows[0].new_row, Some(2));
+        assert_eq!(grid.rows[0].cells[1].new.as_deref(), Some("1"));
+        assert_eq!(grid.rows[1].kind, GridRowKind::Modified);
+        assert_eq!(grid.rows[1].cells[1].kind, GridCellKind::Modified);
+        assert_eq!(grid.rows[1].cells[1].old.as_deref(), Some("2"));
+        assert_eq!(grid.rows[1].cells[1].new.as_deref(), Some("3"));
+        assert!(grid.rows[1].cells[1].diff.is_some());
+        assert_eq!(grid.summary.unchanged, 1);
+        assert_eq!(grid.summary.modified, 1);
+    }
+
+    #[test]
+    fn grid_orders_added_and_removed_rows_by_position() {
+        let old = table(0, 1, &[&["指标", "值"], &["甲", "1"], &["乙", "2"]]);
+        let new = table(
+            0,
+            1,
+            &[&["指标", "值"], &["甲", "1"], &["丙", "9"], &["乙", "2"]],
+        );
+        let (_, grids) = run_all(&old, &new);
+        let kinds: Vec<GridRowKind> = grids[0].rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                GridRowKind::Unchanged,
+                GridRowKind::Added,
+                GridRowKind::Unchanged
+            ]
+        );
+        let added = &grids[0].rows[1];
+        assert_eq!(added.new_row, Some(3));
+        assert_eq!(added.old_row, None);
+        assert_eq!(added.cells[0].new.as_deref(), Some("丙"));
+        assert_eq!(added.cells[0].kind, GridCellKind::Added);
+
+        let old = table(0, 1, &[&["指标", "值"], &["甲", "1"], &["乙", "2"]]);
+        let new = table(0, 1, &[&["指标", "值"], &["乙", "2"]]);
+        let (_, grids) = run_all(&old, &new);
+        let kinds: Vec<GridRowKind> = grids[0].rows.iter().map(|row| row.kind).collect();
+        assert_eq!(kinds, vec![GridRowKind::Removed, GridRowKind::Unchanged]);
+        let removed = &grids[0].rows[0];
+        assert_eq!(removed.old_row, Some(2));
+        assert_eq!(removed.cells[0].old.as_deref(), Some("甲"));
+        assert_eq!(removed.cells[0].kind, GridCellKind::Removed);
+    }
+
+    #[test]
+    fn grid_keeps_old_header_for_renamed_column() {
+        let old = table(0, 1, &[&["指标", "本月"], &["销量", "1"], &["电价", "0.6"]]);
+        let new = table(0, 1, &[&["指标", "本期"], &["销量", "1"], &["电价", "0.6"]]);
+        let (_, grids) = run_all(&old, &new);
+        let grid = &grids[0];
+        assert_eq!(grid.columns[1].label, "本期");
+        assert_eq!(grid.columns[1].old_label.as_deref(), Some("本月"));
+        assert_eq!(grid.columns[1].kind, GridColumnKind::Unchanged);
+        assert_eq!(grid.summary.differences(), 0, "表头改名不产生数据行变化");
+    }
+
+    #[test]
+    fn grid_marks_added_and_removed_columns() {
+        let old = table(0, 1, &[&["指标", "本月"], &["销量", "1"]]);
+        let new = table(0, 1, &[&["指标", "本月", "备注"], &["销量", "1", "完成"]]);
+        let (_, grids) = run_all(&old, &new);
+        let kinds: Vec<GridColumnKind> =
+            grids[0].columns.iter().map(|column| column.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                GridColumnKind::Unchanged,
+                GridColumnKind::Unchanged,
+                GridColumnKind::Added
+            ]
+        );
+        assert_eq!(grids[0].columns[2].label, "备注");
+        assert_eq!(grids[0].rows[0].cells[2].new.as_deref(), Some("完成"));
+        assert_eq!(grids[0].rows[0].cells[2].kind, GridCellKind::Added);
+
+        let old = table(0, 1, &[&["指标", "本月", "备注"], &["销量", "1", "完成"]]);
+        let new = table(0, 1, &[&["指标", "本月"], &["销量", "1"]]);
+        let (_, grids) = run_all(&old, &new);
+        let kinds: Vec<GridColumnKind> =
+            grids[0].columns.iter().map(|column| column.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                GridColumnKind::Unchanged,
+                GridColumnKind::Unchanged,
+                GridColumnKind::Removed
+            ]
+        );
+        assert_eq!(grids[0].columns[2].label, "备注");
+        assert_eq!(grids[0].rows[0].cells[2].old.as_deref(), Some("完成"));
+        assert_eq!(grids[0].rows[0].cells[2].kind, GridCellKind::Removed);
+    }
+
+    #[test]
+    fn grid_keeps_moved_row_on_both_sides() {
+        let old = table(
+            0,
+            1,
+            &[
+                &["事项", "备注"],
+                &["甲项", "甲注"],
+                &["乙项", "乙注"],
+                &["丙项", "丙注"],
+            ],
+        );
+        let new = table(
+            0,
+            1,
+            &[
+                &["事项", "备注"],
+                &["丙项", "丙注"],
+                &["甲项", "甲注"],
+                &["乙项", "乙注"],
+            ],
+        );
+        let (_, grids) = run_all(&old, &new);
+        let kinds: Vec<GridRowKind> = grids[0].rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                GridRowKind::MovedTo,
+                GridRowKind::Unchanged,
+                GridRowKind::Unchanged,
+                GridRowKind::MovedFrom
+            ],
+            "{:#?}",
+            grids[0].rows
+        );
+        let to = &grids[0].rows[0];
+        assert_eq!(to.old_row, Some(4));
+        assert_eq!(to.new_row, Some(2));
+        assert_eq!(to.cells[0].new.as_deref(), Some("丙项"));
+        assert_eq!(to.cells[0].kind, GridCellKind::Added);
+        let from = &grids[0].rows[3];
+        assert_eq!(from.old_row, Some(4));
+        assert_eq!(from.new_row, None);
+        assert_eq!(from.cells[0].old.as_deref(), Some("丙项"));
+        assert_eq!(from.cells[0].kind, GridCellKind::Removed);
+        assert_eq!(grids[0].summary.moved, 1);
+    }
+
+    #[test]
+    fn whole_table_grid_covers_all_rows() {
+        let existing = table(0, 1, &[&["指标", "值"], &["甲", "1"]]);
+        let extra = table(
+            1,
+            3,
+            &[&["姓名", "部门"], &["丙", "办公室"], &["丁", "运检"]],
+        );
+        let (_, grids) = match_tables(
+            std::slice::from_ref(&existing),
+            &[existing.clone(), extra],
+            &Config::default(),
+            None,
+        );
+        let grid = grids
+            .iter()
+            .find(|grid| grid.whole.is_some())
+            .expect("整表新增应产生网格");
+        assert_eq!(grid.table, 2);
+        assert_eq!(grid.whole, Some(Status::Added));
+        assert_eq!(grid.columns.len(), 2);
+        assert_eq!(grid.columns[0].label, "姓名");
+        assert!(
+            grid.columns
+                .iter()
+                .all(|column| column.kind == GridColumnKind::Added)
+        );
+        assert_eq!(grid.rows.len(), 2, "表头行不应进入数据行");
+        assert!(grid.rows.iter().all(|row| row.kind == GridRowKind::Added));
+        assert_eq!(grid.rows[0].cells[1].new.as_deref(), Some("办公室"));
+        assert_eq!(grid.summary.added, 2);
     }
 }

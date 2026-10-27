@@ -18,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Config;
 use crate::diff::excerpt;
@@ -25,8 +26,11 @@ use crate::engine;
 use crate::engine::DocumentKind;
 use crate::matching::Progress;
 use crate::report;
-use crate::result::{CompareOutput, DiffOp, DiffSpan, Record, Status};
-use crate::revision::{self, RevisionBlock, RevisionKind, TableSummary};
+use crate::result::{
+    CompareOutput, DiffOp, DiffSpan, GridCell, GridCellKind, GridColumn, GridColumnKind, GridRow,
+    GridRowKind, Record, Status, TableGrid,
+};
+use crate::revision::{self, RevisionBlock, RevisionKind, RevisionSpan};
 
 mod entry;
 mod picker;
@@ -123,6 +127,17 @@ impl Filter {
         }
     }
 
+    fn matches_row(self, kind: GridRowKind) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Modified => kind == GridRowKind::Modified,
+            Filter::Suspected => kind == GridRowKind::SuspectedModified,
+            Filter::Added => kind == GridRowKind::Added,
+            Filter::Removed => kind == GridRowKind::Removed,
+            Filter::Moved => matches!(kind, GridRowKind::MovedFrom | GridRowKind::MovedTo),
+        }
+    }
+
     fn cycle(self, delta: isize) -> Self {
         let index = Self::ORDER
             .iter()
@@ -143,12 +158,25 @@ impl Filter {
             _ => None,
         }
     }
+
+    fn style(self) -> Style {
+        match self {
+            Filter::All => Style::default().fg(Color::Gray),
+            Filter::Modified => Style::default().fg(Color::Yellow),
+            Filter::Suspected => Style::default().fg(Color::Magenta),
+            Filter::Added => Style::default().fg(Color::Green),
+            Filter::Removed => Style::default().fg(Color::Red),
+            Filter::Moved => Style::default().fg(Color::Cyan),
+        }
+        .add_modifier(Modifier::BOLD)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Records,
     Revision,
+    Table,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +268,27 @@ struct App {
     revision_max_scroll: u16,
     revision_page: u16,
     revision_metrics: Option<RevisionMetrics>,
+    /// 修订视图里当前选中的表格序号（按修订流中的表格顺序）。
+    revision_table_focus: usize,
+    /// 每张表在修订视图中的视觉行号（按当前终端宽度换行后），用于 Tab 切换时定位。
+    revision_table_lines: Vec<usize>,
+    /// 进入表格修订视图时锁定的一张表。
+    table_view: Option<TableGrid>,
+    table_scroll: u16,
+    table_max_scroll: u16,
+    table_hscroll: u16,
+    table_max_hscroll: u16,
+    table_page: u16,
+    /// 当前选中的数据行（0 起始，表头行不参与）。
+    table_selected: usize,
+    /// 当前筛选下可见的数据行在 `TableGrid.rows` 中的下标。
+    table_visible: Vec<usize>,
+    table_filter: Filter,
+    /// 打开行详情浮层时记录的行号。
+    table_detail: Option<usize>,
+    table_detail_scroll: u16,
+    table_detail_max: u16,
+    table_detail_page: u16,
 }
 
 impl App {
@@ -278,6 +327,21 @@ impl App {
             revision_max_scroll: 0,
             revision_page: 1,
             revision_metrics: None,
+            revision_table_focus: 0,
+            revision_table_lines: Vec::new(),
+            table_view: None,
+            table_scroll: 0,
+            table_max_scroll: 0,
+            table_hscroll: 0,
+            table_max_hscroll: 0,
+            table_page: 1,
+            table_selected: 0,
+            table_visible: Vec::new(),
+            table_filter: Filter::All,
+            table_detail: None,
+            table_detail_scroll: 0,
+            table_detail_max: 0,
+            table_detail_page: 1,
         }
     }
 
@@ -303,7 +367,7 @@ impl App {
                     .iter()
                     .map(|record| record_preview(record, 120))
                     .collect();
-                self.revision = revision::build(&output.records);
+                self.revision = revision::build(&output.records, &output.tables);
                 self.state = State::Ready(output);
                 self.view = ViewMode::Records;
                 self.selected = 0;
@@ -314,6 +378,11 @@ impl App {
                 self.revision_scroll = 0;
                 self.revision_max_scroll = 0;
                 self.revision_metrics = None;
+                self.revision_table_focus = 0;
+                self.revision_table_lines.clear();
+                self.table_view = None;
+                self.table_filter = Filter::All;
+                self.reset_table_navigation();
                 self.expanded = false;
                 self.status = Some(StatusMessage {
                     text: "比较完成".to_string(),
@@ -494,6 +563,10 @@ impl App {
             self.toggle_view();
             return;
         }
+        if self.view == ViewMode::Table {
+            self.handle_table_key(key);
+            return;
+        }
         if self.view == ViewMode::Revision {
             self.handle_revision_key(key);
             return;
@@ -508,13 +581,127 @@ impl App {
         self.view = match self.view {
             ViewMode::Records => ViewMode::Revision,
             ViewMode::Revision => ViewMode::Records,
+            ViewMode::Table => ViewMode::Revision,
         };
+        if self.view != ViewMode::Table {
+            self.table_view = None;
+            self.table_detail = None;
+        }
+    }
+
+    fn revision_tables(&self) -> impl Iterator<Item = &TableGrid> {
+        self.revision
+            .iter()
+            .filter_map(|block| block.table.as_ref())
+    }
+
+    fn revision_table_count(&self) -> usize {
+        self.revision_tables().count()
+    }
+
+    fn cycle_revision_table(&mut self, forward: bool) {
+        let count = self.revision_table_count();
+        if count == 0 {
+            return;
+        }
+        let current = self.revision_table_focus.min(count - 1);
+        self.revision_table_focus = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        self.scroll_to_revision_table();
+    }
+
+    fn scroll_to_revision_table(&mut self) {
+        let Some(line) = self
+            .revision_table_lines
+            .get(self.revision_table_focus)
+            .copied()
+        else {
+            return;
+        };
+        let page = self.revision_page.max(1) as usize;
+        let target = line.saturating_sub(page / 3);
+        self.revision_scroll = target.min(self.revision_max_scroll as usize) as u16;
+    }
+
+    fn reset_table_navigation(&mut self) {
+        self.table_scroll = 0;
+        self.table_max_scroll = 0;
+        self.table_hscroll = 0;
+        self.table_max_hscroll = 0;
+        self.table_selected = 0;
+        self.table_detail = None;
+        self.table_detail_scroll = 0;
+        self.table_detail_max = 0;
+        self.refresh_table_visible();
+    }
+
+    fn refresh_table_visible(&mut self) {
+        self.table_visible = self
+            .table_view
+            .as_ref()
+            .map(|table| visible_table_rows(table, self.table_filter))
+            .unwrap_or_default();
+        if self.table_visible.is_empty() {
+            self.table_selected = 0;
+        } else {
+            self.table_selected = self.table_selected.min(self.table_visible.len() - 1);
+        }
+    }
+
+    fn set_table_filter(&mut self, filter: Filter) {
+        self.table_filter = filter;
+        self.table_selected = 0;
+        self.table_scroll = 0;
+        self.table_detail = None;
+        self.refresh_table_visible();
+        self.scroll_table_to_selected();
+    }
+
+    fn open_table_view(&mut self) {
+        let Some(table) = self
+            .revision_tables()
+            .nth(self.revision_table_focus)
+            .cloned()
+        else {
+            return;
+        };
+        self.table_view = Some(table);
+        self.reset_table_navigation();
+        self.view = ViewMode::Table;
+    }
+
+    fn switch_table_view(&mut self, forward: bool) {
+        let count = self.revision_table_count();
+        if count == 0 {
+            return;
+        }
+        let current = self.revision_table_focus.min(count - 1);
+        let next = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        self.revision_table_focus = next;
+        let next_table = self.revision_tables().nth(next).cloned();
+        if let Some(table) = next_table {
+            self.table_view = Some(table);
+            self.reset_table_navigation();
+        }
     }
 
     fn scroll_revision(&mut self, delta: isize) {
         let current = self.revision_scroll as isize;
         let max = self.revision_max_scroll as isize;
         self.revision_scroll = current.saturating_add(delta).clamp(0, max) as u16;
+    }
+
+    fn scroll_table_h(&mut self, delta: isize) {
+        let current = self.table_hscroll as isize;
+        let max = self.table_max_hscroll as isize;
+        self.table_hscroll = current.saturating_add(delta).clamp(0, max) as u16;
     }
 
     fn handle_revision_key(&mut self, key: KeyEvent) {
@@ -525,6 +712,9 @@ impl App {
             KeyCode::Esc => self.view = ViewMode::Records,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('e') => self.open_export(),
+            KeyCode::Tab => self.cycle_revision_table(true),
+            KeyCode::BackTab => self.cycle_revision_table(false),
+            KeyCode::Enter => self.open_table_view(),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_revision(-1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_revision(1),
             KeyCode::PageUp | KeyCode::Char('b') => self.scroll_revision(-page),
@@ -535,6 +725,134 @@ impl App {
             KeyCode::Char('d') => self.scroll_revision(half),
             KeyCode::Home | KeyCode::Char('g') => self.scroll_revision(isize::MIN / 2),
             KeyCode::End | KeyCode::Char('G') => self.scroll_revision(isize::MAX / 2),
+            _ => {}
+        }
+    }
+
+    fn table_row_count(&self) -> usize {
+        self.table_visible.len()
+    }
+
+    fn move_table_selection(&mut self, delta: isize) {
+        let count = self.table_row_count();
+        if count == 0 {
+            return;
+        }
+        let selected = (self.table_selected as isize)
+            .saturating_add(delta)
+            .clamp(0, count as isize - 1) as usize;
+        self.table_selected = selected;
+        self.scroll_table_to_selected();
+    }
+
+    fn select_table_row(&mut self, index: usize) {
+        let count = self.table_row_count();
+        if count == 0 {
+            return;
+        }
+        self.table_selected = index.min(count - 1);
+        self.scroll_table_to_selected();
+    }
+
+    fn scroll_table_to_selected(&mut self) {
+        let count = self.table_row_count();
+        if count == 0 {
+            return;
+        }
+        let line = 3 + self.table_selected.min(count - 1);
+        let page = self.table_page.max(1) as usize;
+        let scroll = self.table_scroll as usize;
+        let target = if line < scroll {
+            line
+        } else if line >= scroll + page {
+            line + 1 - page
+        } else {
+            scroll
+        };
+        self.table_scroll = target.min(self.table_max_scroll as usize) as u16;
+    }
+
+    fn open_table_detail(&mut self) {
+        if self.table_row_count() == 0 {
+            return;
+        }
+        let Some(&row_index) = self.table_visible.get(self.table_selected) else {
+            return;
+        };
+        self.table_detail = Some(row_index);
+        self.table_detail_scroll = 0;
+        self.table_detail_max = 0;
+    }
+
+    fn scroll_table_detail(&mut self, delta: isize) {
+        let current = self.table_detail_scroll as isize;
+        let max = self.table_detail_max as isize;
+        self.table_detail_scroll = current.saturating_add(delta).clamp(0, max) as u16;
+    }
+
+    fn handle_table_detail_key(&mut self, key: KeyEvent) {
+        let page = self.table_detail_page.max(1) as isize;
+        let half = (page / 2).max(1);
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => self.table_detail = None,
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_table_detail(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_table_detail(1),
+            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_table_detail(-page),
+            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
+                self.scroll_table_detail(page);
+            }
+            KeyCode::Char('u') => self.scroll_table_detail(-half),
+            KeyCode::Char('d') => self.scroll_table_detail(half),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_table_detail(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_table_detail(isize::MAX / 2),
+            _ => {}
+        }
+    }
+
+    fn handle_table_key(&mut self, key: KeyEvent) {
+        if self.table_detail.is_some() {
+            self.handle_table_detail_key(key);
+            return;
+        }
+        let page = self.table_page.max(1) as isize;
+        let half = (page / 2).max(1);
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => {
+                self.view = ViewMode::Revision;
+                self.table_view = None;
+                self.table_detail = None;
+            }
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('e') => self.open_export(),
+            KeyCode::Enter => self.open_table_detail(),
+            KeyCode::Tab => self.set_table_filter(self.table_filter.cycle(1)),
+            KeyCode::BackTab => self.set_table_filter(self.table_filter.cycle(-1)),
+            KeyCode::Char(ch @ '1'..='6') => {
+                if let Some(filter) = Filter::from_number(ch) {
+                    self.set_table_filter(filter);
+                }
+            }
+            KeyCode::Char('[') => self.switch_table_view(false),
+            KeyCode::Char(']') => self.switch_table_view(true),
+            KeyCode::Left | KeyCode::Char('h') => self.scroll_table_h(-4),
+            KeyCode::Right | KeyCode::Char('l') => self.scroll_table_h(4),
+            KeyCode::Up | KeyCode::Char('k') => self.move_table_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_table_selection(1),
+            KeyCode::PageUp | KeyCode::Char('b') => self.move_table_selection(-page),
+            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
+                self.move_table_selection(page);
+            }
+            KeyCode::Char('u') => self.move_table_selection(-half),
+            KeyCode::Char('d') => self.move_table_selection(half),
+            KeyCode::Home | KeyCode::Char('g') => self.select_table_row(0),
+            KeyCode::End | KeyCode::Char('G') => {
+                let count = self.table_row_count();
+                if count > 0 {
+                    self.select_table_row(count - 1);
+                }
+            }
             _ => {}
         }
     }
@@ -964,6 +1282,11 @@ fn draw_ready(frame: &mut Frame, area: Rect, app: &mut App) {
     let State::Ready(output) = &app.state else {
         return;
     };
+    if app.view == ViewMode::Table {
+        draw_table_view(frame, layout[1], app);
+        draw_table_bar(frame, layout[0], app);
+        return;
+    }
     if app.view == ViewMode::Revision {
         draw_revision_bar(frame, layout[0], output);
         draw_revision(frame, layout[1], app);
@@ -1132,8 +1455,176 @@ fn draw_revision_bar(frame: &mut Frame, area: Rect, output: &CompareOutput) {
     );
 }
 
+fn draw_table_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(table) = app.table_view.as_ref() else {
+        return;
+    };
+    let total = app.revision_table_count();
+    let position = if total == 0 {
+        String::new()
+    } else {
+        format!(
+            "  表格 {}/{}",
+            (app.revision_table_focus + 1).min(total),
+            total
+        )
+    };
+    let mut spans = vec![
+        Span::styled(
+            "表格修订",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}", table_label(table)),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(position, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  筛选：{}", app.table_filter.label()),
+            app.table_filter.style(),
+        ),
+    ];
+    let rows = app.table_visible.len();
+    if rows > 0 {
+        spans.push(Span::styled(
+            format!("  行 {}/{}", app.table_selected.min(rows - 1) + 1, rows),
+            Style::default().fg(Color::Cyan),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "  行 0/0",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if app.table_max_hscroll > 0 {
+        spans.push(Span::styled(
+            format!(
+                "  横向 {}/{}",
+                app.table_hscroll.min(app.table_max_hscroll),
+                app.table_max_hscroll
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let bar = Layout::horizontal([Constraint::Min(0), Constraint::Length(18)]).split(area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), bar[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "v/Esc 返回修订",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Right),
+        bar[1],
+    );
+}
+
+fn draw_table_view(frame: &mut Frame, area: Rect, app: &mut App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                "表格修订",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "：完整行列（删除线=旧值，下划线=新值）",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    app.refresh_table_visible();
+    let Some(table) = app.table_view.as_ref() else {
+        return;
+    };
+    let row_count = app.table_visible.len();
+    let (mut lines, max_hscroll) =
+        table_view_lines(table, inner.width, app.table_hscroll, &app.table_visible);
+    let hscroll = app.table_hscroll.min(max_hscroll);
+    app.table_hscroll = hscroll;
+    app.table_max_hscroll = max_hscroll;
+    if row_count == 0 {
+        app.table_selected = 0;
+    } else {
+        app.table_selected = app.table_selected.min(row_count - 1);
+        let index = 3 + app.table_selected;
+        if let Some(line) = lines.get(index) {
+            let used: usize = line
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            let mut spans = line.spans.clone();
+            if used < inner.width as usize {
+                spans.push(Span::raw(" ".repeat(inner.width as usize - used)));
+            }
+            lines[index] = Line::from(spans).style(Style::default().bg(Color::Rgb(38, 48, 68)));
+        }
+    }
+    let max = lines
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    let scroll = app.table_scroll.min(max);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+    app.table_scroll = scroll;
+    app.table_max_scroll = max;
+    app.table_page = inner.height;
+    if let Some(row_index) = app.table_detail {
+        draw_table_detail(frame, area, app, row_index);
+    }
+}
+
+fn draw_table_detail(frame: &mut Frame, area: Rect, app: &mut App, row_index: usize) {
+    let Some(table) = app.table_view.as_ref() else {
+        return;
+    };
+    if table.rows.get(row_index).is_none() {
+        app.table_detail = None;
+        return;
+    }
+    let rect = centered_rect(84, 76, area);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                "行详情",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {}", table_label(table)),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    let inner = block.inner(rect);
+    let lines = table_detail_lines(table, row_index);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    let total = paragraph.line_count(inner.width);
+    let max = total
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    let scroll = app.table_detail_scroll.min(max);
+    frame.render_widget(paragraph.scroll((scroll, 0)), rect);
+    app.table_detail_scroll = scroll;
+    app.table_detail_max = max;
+    app.table_detail_page = inner.height;
+}
+
 fn draw_revision(frame: &mut Frame, area: Rect, app: &mut App) {
-    let lines = revision_lines(&app.revision);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1155,6 +1646,15 @@ fn draw_revision(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    let table_count = app.revision_table_count();
+    if table_count == 0 {
+        app.revision_table_focus = 0;
+    } else if app.revision_table_focus >= table_count {
+        app.revision_table_focus = table_count - 1;
+    }
+    let focus = (table_count > 0).then_some(app.revision_table_focus);
+    let (lines, table_lines) = revision_lines(&app.revision, inner.width, focus);
+    app.revision_table_lines = table_lines;
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let cached = app
         .revision_metrics
@@ -1179,25 +1679,53 @@ fn draw_revision(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn revision_lines(blocks: &[RevisionBlock]) -> Vec<Line<'static>> {
+fn revision_lines(
+    blocks: &[RevisionBlock],
+    width: u16,
+    table_focus: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = Vec::new();
+    let mut table_lines = Vec::new();
+    let mut table_index = 0usize;
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
             lines.push(Line::from(""));
         }
+        if block.table.is_some() {
+            table_lines.push(lines.len());
+            let focused = table_focus == Some(table_index);
+            table_index += 1;
+            if let Some(table) = block.table.as_ref() {
+                lines.push(table_placeholder_line(table, focused, width));
+            }
+            continue;
+        }
         append_revision_block(&mut lines, block);
     }
-    lines
+    let mut table_positions = Vec::with_capacity(table_lines.len());
+    let mut next = 0usize;
+    let mut offset = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        while next < table_lines.len() && table_lines[next] == index {
+            table_positions.push(offset);
+            next += 1;
+        }
+        offset += line_visual_height(line, width);
+    }
+    (lines, table_positions)
+}
+
+fn line_visual_height(line: &Line<'_>, width: u16) -> usize {
+    let total: usize = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let width = width.max(1) as usize;
+    total.div_ceil(width).max(1)
 }
 
 fn append_revision_block(lines: &mut Vec<Line<'static>>, block: &RevisionBlock) {
-    if block.kind == RevisionKind::Table {
-        if let Some(table) = block.table.as_ref() {
-            lines.push(table_summary_line(table));
-        }
-        return;
-    }
-
     let (tag, style) = revision_tag(block);
     let mut current = Line::from(vec![Span::styled(tag, style)]);
     if let Some(note) = block.note.as_ref() {
@@ -1207,12 +1735,20 @@ fn append_revision_block(lines: &mut Vec<Line<'static>>, block: &RevisionBlock) 
         ));
     }
     current.spans.push(Span::raw(" "));
-    for span in &block.spans {
+    extend_revision_spans(lines, &mut current, &block.spans);
+    lines.push(current);
+}
+
+fn extend_revision_spans(
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Line<'static>,
+    spans: &[RevisionSpan],
+) {
+    for span in spans {
         let span_style = revision_span_style(span.op);
         for (index, part) in span.text.split('\n').enumerate() {
             if index > 0 {
-                lines.push(current);
-                current = Line::from("");
+                lines.push(std::mem::replace(current, Line::from("")));
             }
             if !part.is_empty() {
                 current
@@ -1221,7 +1757,6 @@ fn append_revision_block(lines: &mut Vec<Line<'static>>, block: &RevisionBlock) 
             }
         }
     }
-    lines.push(current);
 }
 
 fn revision_tag(block: &RevisionBlock) -> (String, Style) {
@@ -1283,8 +1818,8 @@ fn revision_span_style(op: DiffOp) -> Style {
     }
 }
 
-fn table_summary_line(table: &TableSummary) -> Line<'static> {
-    let label = match table.caption.as_ref() {
+fn table_label(table: &TableGrid) -> String {
+    match table.caption.as_ref() {
         Some(caption) => {
             let caption = caption.replace(['\n', '\t'], " ");
             let caption = caption.trim();
@@ -1297,58 +1832,743 @@ fn table_summary_line(table: &TableSummary) -> Line<'static> {
             }
         }
         None => format!("表{}", table.table),
-    };
+    }
+}
+
+fn table_placeholder_line(table: &TableGrid, focused: bool, width: u16) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
-            "▦ ",
+            if focused { "> " } else { "  " },
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            label,
+            table_label(table),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw("  "),
+        Span::styled(
+            table_summary_text(table),
+            Style::default().fg(if focused {
+                Color::White
+            } else {
+                Color::DarkGray
+            }),
+        ),
     ];
-    let mut counts = Vec::new();
-    if table.whole.is_some() {
-        counts.push(
-            match table.whole {
-                Some(Status::Added) => "整表新增",
-                Some(Status::Removed) => "整表删除",
-                _ => "整表变化",
-            }
-            .to_string(),
-        );
-    } else {
-        if table.added > 0 {
-            counts.push(format!("新增 {} 行", table.added));
+    if focused {
+        spans.push(Span::styled(
+            "   Enter 查看表格修订",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let effective = width.saturating_sub(GRID_SAFETY as u16);
+    let mut line = clip_line(Line::from(spans), effective);
+    if focused {
+        let filled = used.min(effective as usize);
+        if filled < effective as usize {
+            line.spans
+                .push(Span::raw(" ".repeat(effective as usize - filled)));
         }
-        if table.removed > 0 {
-            counts.push(format!("删除 {} 行", table.removed));
-        }
-        if table.modified > 0 {
-            counts.push(format!("修改 {} 行", table.modified));
-        }
-        if table.moved > 0 {
-            counts.push(format!("移动 {} 行", table.moved));
-        }
-        if counts.is_empty() {
-            counts.push("无变化行".to_string());
+        line = line.style(Style::default().bg(Color::Rgb(38, 48, 68)));
+    }
+    line
+}
+
+fn table_view_lines(
+    table: &TableGrid,
+    width: u16,
+    hscroll: u16,
+    visible: &[usize],
+) -> (Vec<Line<'static>>, u16) {
+    let mut lines = Vec::new();
+    if table.columns.is_empty() {
+        lines.push(clip_line(
+            Line::from(Span::styled(
+                "     （表格无列信息）",
+                Style::default().fg(Color::DarkGray),
+            )),
+            width,
+        ));
+        return (lines, 0);
+    }
+    let widths = grid_widths(table);
+    let view = width.saturating_sub(GRID_SAFETY as u16) as usize;
+    let cell_area = grid_total_width(&widths).saturating_sub(GRID_GUTTER);
+    let max_hscroll = cell_area.saturating_sub(view.saturating_sub(GRID_GUTTER));
+    let offset = (hscroll as usize).min(max_hscroll);
+    lines.push(clip_line(table_legend_line(table), width));
+    lines.push(window_line(table_header_line(table, &widths), offset, view));
+    lines.push(window_line(table_separator_line(&widths), offset, view));
+    for &row_index in visible {
+        if let Some(row) = table.rows.get(row_index) {
+            lines.push(window_line(table_row_line(row, &widths), offset, view));
         }
     }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        counts.join(" · "),
-        Style::default().fg(Color::Yellow),
-    ));
-    spans.push(Span::styled(
-        "（表格内容差异暂未标记）",
-        Style::default().fg(Color::DarkGray),
-    ));
+    if visible.is_empty() {
+        let message = if table.rows.is_empty() {
+            "（表格无数据行）"
+        } else {
+            "（当前筛选无变化行）"
+        };
+        lines.push(clip_line(
+            Line::from(Span::styled(
+                format!("      {message}"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            width,
+        ));
+    }
+    lines.push(window_line(table_separator_line(&widths), offset, view));
+    (lines, max_hscroll.min(u16::MAX as usize) as u16)
+}
+
+/// 保留左侧行号/标记栏，只对列区域做横向开窗。
+fn window_line(line: Line<'static>, offset: usize, view: usize) -> Line<'static> {
+    if view == 0 {
+        return Line::from("");
+    }
+    if view <= GRID_GUTTER {
+        return clip_line(line, view as u16);
+    }
+    let total: usize = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if offset == 0 && total <= view {
+        return line;
+    }
+    let start = GRID_GUTTER + offset;
+    let end = start + (view - GRID_GUTTER);
+    let mut spans = Vec::new();
+    let mut col = 0usize;
+    let mut kept = 0usize;
+    for span in line.spans {
+        let style = span.style;
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let ch_width = if ch == '\n' || ch == '\t' {
+                1
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            };
+            let from = col;
+            col += ch_width;
+            if col <= GRID_GUTTER || (from >= start && col <= end) {
+                text.push(if ch == '\n' || ch == '\t' { ' ' } else { ch });
+                kept += ch_width;
+            } else if from < start && col > start && from >= GRID_GUTTER {
+                let pad = col - start;
+                text.push_str(&" ".repeat(pad));
+                kept += pad;
+            }
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, style));
+        }
+    }
+    if kept < view {
+        spans.push(Span::raw(" ".repeat(view - kept)));
+    }
     Line::from(spans)
+}
+
+fn clip_line(line: Line<'static>, width: u16) -> Line<'static> {
+    let max = width as usize;
+    let total: usize = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if total <= max {
+        return line;
+    }
+    let limit = max.saturating_sub(1);
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+    for span in line.spans {
+        let style = span.style;
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + char_width > limit {
+                truncated = true;
+                break;
+            }
+            text.push(ch);
+            used += char_width;
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, style));
+        }
+        if truncated {
+            break;
+        }
+    }
+    spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+    Line::from(spans)
+}
+
+fn visible_table_rows(table: &TableGrid, filter: Filter) -> Vec<usize> {
+    table
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| filter.matches_row(row.kind))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn grid_has_changes(table: &TableGrid) -> bool {
+    table.whole.is_some()
+        || table.summary.differences() > 0
+        || table.columns.iter().any(|column| {
+            column.kind != GridColumnKind::Unchanged
+                || column
+                    .old_label
+                    .as_deref()
+                    .is_some_and(|old| old != column.label)
+        })
+}
+
+fn table_summary_text(table: &TableGrid) -> String {
+    if let Some(whole) = table.whole {
+        return format!(
+            "{} | 共 {} 行",
+            match whole {
+                Status::Added => "整表新增",
+                Status::Removed => "整表删除",
+                _ => "整表变化",
+            },
+            table.rows.len()
+        );
+    }
+    if !grid_has_changes(table) {
+        return "无变化".to_string();
+    }
+    let summary = &table.summary;
+    let mut parts = vec![format!("未变 {}", summary.unchanged)];
+    if summary.added > 0 {
+        parts.push(format!("新增 {}", summary.added));
+    }
+    if summary.removed > 0 {
+        parts.push(format!("删除 {}", summary.removed));
+    }
+    if summary.modified > 0 {
+        parts.push(format!("修改 {}", summary.modified));
+    }
+    if summary.suspected_modified > 0 {
+        parts.push(format!("疑似 {}", summary.suspected_modified));
+    }
+    if summary.moved > 0 {
+        parts.push(format!("移动 {}", summary.moved));
+    }
+    let renamed = table
+        .columns
+        .iter()
+        .filter(|column| {
+            column.kind == GridColumnKind::Unchanged
+                && column
+                    .old_label
+                    .as_deref()
+                    .is_some_and(|old| old != column.label)
+        })
+        .count();
+    if renamed > 0 {
+        parts.push(format!("改列名 {renamed}"));
+    }
+    parts.join(" | ")
+}
+
+fn table_legend_line(table: &TableGrid) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "      标记：",
+        Style::default().fg(Color::DarkGray),
+    )];
+    spans.push(Span::styled("+ 新增  ", Style::default().fg(Color::Green)));
+    spans.push(Span::styled("- 删除  ", Style::default().fg(Color::Red)));
+    spans.push(Span::styled("~ 修改  ", Style::default().fg(Color::Yellow)));
+    spans.push(Span::styled("> 移入  ", Style::default().fg(Color::Green)));
+    spans.push(Span::styled("< 移出", Style::default().fg(Color::Red)));
+    let moves: Vec<String> = table
+        .rows
+        .iter()
+        .filter(|row| row.kind == GridRowKind::MovedTo)
+        .filter_map(|row| Some(format!("旧{}->新{}", row.old_row?, row.new_row?)))
+        .collect();
+    if !moves.is_empty() {
+        spans.push(Span::styled(
+            format!("  （移动：{}）", moves.join("，")),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    let reordered: Vec<String> = table
+        .rows
+        .iter()
+        .filter(|row| row.note.as_deref() == Some("行序变化"))
+        .filter_map(|row| Some(format!("旧{}->新{}", row.old_row?, row.new_row?)))
+        .collect();
+    if !reordered.is_empty() {
+        spans.push(Span::styled(
+            format!("  （行序变化：{}）", reordered.join("，")),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Line::from(spans)
+}
+
+const GRID_GUTTER: usize = 6;
+const GRID_MIN_COL: usize = 6;
+const GRID_MAX_COL: usize = 36;
+/// 右侧留 2 列余量：个别字符（如破折号）在部分终端按双宽渲染时，
+/// 不至于把整行推到窗口宽度之外而折行。
+const GRID_SAFETY: usize = 2;
+
+fn grid_total_width(widths: &[usize]) -> usize {
+    GRID_GUTTER + widths.len() * 3 + 1 + widths.iter().sum::<usize>()
+}
+
+/// 各列取内容自然宽度并夹在最小/最大列宽之间；超出终端时靠横向滚动查看，
+/// 不再把列压到只剩省略号。
+fn grid_widths(table: &TableGrid) -> Vec<usize> {
+    table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let mut max = UnicodeWidthStr::width(column_header_text(column).as_str());
+            for row in &table.rows {
+                if let Some(cell) = row.cells.get(index) {
+                    let spans = grid_cell_spans(row, cell);
+                    let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+                    max = max.max(UnicodeWidthStr::width(text.as_str()));
+                }
+            }
+            max.clamp(GRID_MIN_COL, GRID_MAX_COL)
+        })
+        .collect()
+}
+
+fn column_label_style(kind: GridColumnKind) -> Style {
+    match kind {
+        GridColumnKind::Added => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        GridColumnKind::Removed => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        GridColumnKind::Unchanged => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn table_header_line(table: &TableGrid, widths: &[usize]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ".repeat(GRID_GUTTER))];
+    for (column, width) in table.columns.iter().zip(widths) {
+        spans.push(Span::styled("|", grid_bar_style()));
+        spans.push(Span::raw(" "));
+        spans.extend(fit_text_with_style(
+            &column_header_text(column),
+            *width,
+            column_label_style(column.kind),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled("|", grid_bar_style()));
+    Line::from(spans)
+}
+
+fn table_separator_line(widths: &[usize]) -> Line<'static> {
+    let mut spans = vec![Span::styled("-".repeat(GRID_GUTTER), grid_bar_style())];
+    for width in widths {
+        spans.push(Span::styled("+", grid_bar_style()));
+        spans.push(Span::styled("-".repeat(width + 2), grid_bar_style()));
+    }
+    spans.push(Span::styled("+", grid_bar_style()));
+    Line::from(spans)
+}
+
+fn table_row_line(row: &GridRow, widths: &[usize]) -> Line<'static> {
+    let (marker, style) = grid_row_marker(row.kind);
+    let number = match row.kind {
+        GridRowKind::Removed | GridRowKind::MovedFrom => row.old_row,
+        _ => row.new_row.or(row.old_row),
+    };
+    let number = number
+        .map(|value| format!("{value:>3}"))
+        .unwrap_or_else(|| "  -".to_string());
+    let mut spans = vec![
+        Span::styled(marker, style),
+        Span::raw(" "),
+        Span::styled(number, Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ];
+    for (index, width) in widths.iter().enumerate() {
+        spans.push(Span::styled("|", grid_bar_style()));
+        spans.push(Span::raw(" "));
+        let cell_spans = row
+            .cells
+            .get(index)
+            .map(|cell| grid_cell_spans(row, cell))
+            .unwrap_or_default();
+        spans.extend(clip_spans(&cell_spans, *width));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled("|", grid_bar_style()));
+    Line::from(spans)
+}
+
+fn row_position_label(row: &GridRow) -> String {
+    match (row.old_row, row.new_row) {
+        (Some(old), Some(new)) if old == new => format!("第 {new} 行"),
+        (Some(old), Some(new)) => format!("旧 #{old} → 新 #{new}"),
+        (Some(old), None) => format!("旧 #{old}（已删除）"),
+        (None, Some(new)) => format!("新 #{new}（新增）"),
+        (None, None) => "行号未知".to_string(),
+    }
+}
+
+fn row_kind_label(kind: GridRowKind) -> &'static str {
+    match kind {
+        GridRowKind::Unchanged => "未变",
+        GridRowKind::Added => "新增",
+        GridRowKind::Removed => "删除",
+        GridRowKind::Modified => "修改",
+        GridRowKind::SuspectedModified => "疑似修改",
+        GridRowKind::MovedFrom => "移出",
+        GridRowKind::MovedTo => "移入",
+    }
+}
+
+fn table_detail_lines(table: &TableGrid, row_index: usize) -> Vec<Line<'static>> {
+    let Some(row) = table.rows.get(row_index) else {
+        return Vec::new();
+    };
+    let (marker, style) = grid_row_marker(row.kind);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{marker} "), style),
+        Span::styled(
+            format!("{} · {}", row_kind_label(row.kind), row_position_label(row)),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    if let Some(note) = row.note.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("  {note}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    for (index, column) in table.columns.iter().enumerate() {
+        lines.push(Line::from(Span::styled(
+            column_header_text(column),
+            column_label_style(column.kind),
+        )));
+        lines.extend(detail_cell_lines(row, row.cells.get(index)));
+    }
+    lines
+}
+
+fn detail_cell_lines(row: &GridRow, cell: Option<&GridCell>) -> Vec<Line<'static>> {
+    let Some(cell) = cell else {
+        return vec![detail_value_line("（无此列）", None, DiffOp::Equal)];
+    };
+    let row_op = match row.kind {
+        GridRowKind::Added | GridRowKind::MovedTo => Some(DiffOp::Insert),
+        GridRowKind::Removed | GridRowKind::MovedFrom => Some(DiffOp::Delete),
+        _ => None,
+    };
+    if let Some(op) = row_op {
+        let text = if op == DiffOp::Insert {
+            cell.new.as_deref().or(cell.old.as_deref())
+        } else {
+            cell.old.as_deref().or(cell.new.as_deref())
+        };
+        return vec![detail_value_line("", text, op)];
+    }
+    match cell.kind {
+        GridCellKind::Unchanged => vec![detail_value_line(
+            "",
+            cell.new.as_deref().or(cell.old.as_deref()),
+            DiffOp::Equal,
+        )],
+        GridCellKind::Added => vec![detail_value_line(
+            "新增：",
+            cell.new.as_deref(),
+            DiffOp::Insert,
+        )],
+        GridCellKind::Removed => {
+            vec![detail_value_line(
+                "删除：",
+                cell.old.as_deref(),
+                DiffOp::Delete,
+            )]
+        }
+        GridCellKind::Modified => {
+            let spans = match cell.diff.as_ref() {
+                Some(diff) => sanitize_spans(revision::merge_diff(diff)),
+                None => {
+                    let mut spans = text_spans(cell.old.as_deref(), DiffOp::Delete);
+                    spans.extend(text_spans(cell.new.as_deref(), DiffOp::Insert));
+                    spans
+                }
+            };
+            vec![detail_span_line("差异：", &spans)]
+        }
+    }
+}
+
+fn detail_span_line(prefix: &str, spans: &[RevisionSpan]) -> Line<'static> {
+    let mut out = vec![Span::raw("  ")];
+    if !prefix.is_empty() {
+        out.push(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if spans.is_empty() {
+        out.push(Span::styled("（空）", Style::default().fg(Color::DarkGray)));
+    } else {
+        for span in spans {
+            out.push(Span::styled(
+                span.text.clone(),
+                revision_span_style(span.op),
+            ));
+        }
+    }
+    Line::from(out)
+}
+
+fn detail_value_line(prefix: &str, text: Option<&str>, op: DiffOp) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    if !prefix.is_empty() {
+        spans.push(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let text = text
+        .map(sanitize_cell_text)
+        .filter(|value| !value.is_empty());
+    match text {
+        Some(text) => spans.push(Span::styled(text, revision_span_style(op))),
+        None => spans.push(Span::styled("（空）", Style::default().fg(Color::DarkGray))),
+    }
+    Line::from(spans)
+}
+
+fn column_header_text(column: &GridColumn) -> String {
+    let label = sanitize_cell_text(&column.label);
+    match column.kind {
+        GridColumnKind::Added => format!("+{label}"),
+        GridColumnKind::Removed => format!("-{label}"),
+        GridColumnKind::Unchanged => match column.old_label.as_deref() {
+            Some(old) if old != column.label => {
+                format!("{}->{label}", sanitize_cell_text(old))
+            }
+            _ => label,
+        },
+    }
+}
+
+fn grid_row_marker(kind: GridRowKind) -> (&'static str, Style) {
+    match kind {
+        GridRowKind::Unchanged => (" ", Style::default()),
+        GridRowKind::Added => (
+            "+",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        GridRowKind::Removed => (
+            "-",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        GridRowKind::Modified => (
+            "~",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        GridRowKind::SuspectedModified => (
+            "~",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        GridRowKind::MovedFrom => (
+            "<",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        GridRowKind::MovedTo => (
+            ">",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+    }
+}
+
+fn grid_cell_spans(row: &GridRow, cell: &GridCell) -> Vec<RevisionSpan> {
+    let row_op = match row.kind {
+        GridRowKind::Added | GridRowKind::MovedTo => Some(DiffOp::Insert),
+        GridRowKind::Removed | GridRowKind::MovedFrom => Some(DiffOp::Delete),
+        _ => None,
+    };
+    if let Some(op) = row_op {
+        let text = if op == DiffOp::Insert {
+            cell.new.as_deref().or(cell.old.as_deref())
+        } else {
+            cell.old.as_deref().or(cell.new.as_deref())
+        };
+        return text_spans(text, op);
+    }
+    match cell.kind {
+        GridCellKind::Unchanged => {
+            text_spans(cell.new.as_deref().or(cell.old.as_deref()), DiffOp::Equal)
+        }
+        GridCellKind::Added => text_spans(cell.new.as_deref(), DiffOp::Insert),
+        GridCellKind::Removed => text_spans(cell.old.as_deref(), DiffOp::Delete),
+        GridCellKind::Modified => {
+            if let Some(diff) = cell.diff.as_ref() {
+                sanitize_spans(revision::merge_diff(diff))
+            } else {
+                let mut spans = text_spans(cell.old.as_deref(), DiffOp::Delete);
+                spans.extend(text_spans(cell.new.as_deref(), DiffOp::Insert));
+                spans
+            }
+        }
+    }
+}
+
+fn sanitize_cell_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+fn sanitize_spans(spans: Vec<RevisionSpan>) -> Vec<RevisionSpan> {
+    spans
+        .into_iter()
+        .map(|span| RevisionSpan {
+            op: span.op,
+            text: sanitize_cell_text(&span.text),
+        })
+        .collect()
+}
+
+fn text_spans(text: Option<&str>, op: DiffOp) -> Vec<RevisionSpan> {
+    text.filter(|text| !text.is_empty())
+        .map(|text| {
+            vec![RevisionSpan {
+                op,
+                text: sanitize_cell_text(text),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn clip_spans(spans: &[RevisionSpan], width: usize) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let total: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum();
+    let limit = if total <= width {
+        width
+    } else {
+        width.saturating_sub(1)
+    };
+    let mut result = Vec::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+    for span in spans {
+        let style = revision_span_style(span.op);
+        let mut text = String::new();
+        for ch in span.text.chars() {
+            let ch_width = if ch == '\n' || ch == '\t' {
+                1
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            };
+            if used + ch_width > limit {
+                truncated = true;
+                break;
+            }
+            text.push(if ch == '\n' || ch == '\t' { ' ' } else { ch });
+            used += ch_width;
+        }
+        if !text.is_empty() {
+            result.push(Span::styled(text, style));
+        }
+        if truncated {
+            break;
+        }
+    }
+    if truncated {
+        result.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+        used += 1;
+    }
+    if used < width {
+        result.push(Span::raw(" ".repeat(width - used)));
+    }
+    result
+}
+
+fn fit_text_with_style(text: &str, width: usize, style: Style) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let total = UnicodeWidthStr::width(text);
+    let limit = if total <= width {
+        width
+    } else {
+        width.saturating_sub(1)
+    };
+    let mut output = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = if ch == '\n' || ch == '\t' {
+            1
+        } else {
+            UnicodeWidthChar::width(ch).unwrap_or(0)
+        };
+        if used + ch_width > limit {
+            break;
+        }
+        output.push(if ch == '\n' || ch == '\t' { ' ' } else { ch });
+        used += ch_width;
+    }
+    let mut result = Vec::new();
+    if !output.is_empty() {
+        result.push(Span::styled(output, style));
+    }
+    if total > width {
+        result.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+        used += 1;
+    }
+    if used < width {
+        result.push(Span::raw(" ".repeat(width - used)));
+    }
+    result
+}
+
+fn grid_bar_style() -> Style {
+    Style::default().fg(Color::DarkGray)
 }
 
 fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, context_chars: usize) {
@@ -1737,9 +2957,27 @@ fn spans_lines(spans: &[DiffSpan]) -> Vec<Line<'static>> {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
     let keys = match app.state {
+        State::Ready(_) if app.view == ViewMode::Table => {
+            if app.table_detail.is_some() {
+                "焦点：行详情   ↑↓/jk 滚动   PgUp/PgDn 翻页   d/u 半页   g/G 首尾   q/Esc/Enter 关闭   ? 帮助   Ctrl+C 退出"
+                    .to_string()
+            } else {
+                "焦点：表格修订   Tab 筛选   ↑↓/jk 选行   ←→/hl 横向   Enter 行详情   [ ] 切表   v/Esc 返回修订   ? 帮助   q 退出"
+                    .to_string()
+            }
+        }
         State::Ready(_) if app.view == ViewMode::Revision => {
-            "焦点：修订视图   j/k 滚动   PgUp/PgDn 翻页   d/u 半页   g/G 首尾   v/Esc 返回记录   e 导出   ? 帮助   q 退出"
-                .to_string()
+            let tables = app.revision_table_count();
+            if tables == 0 {
+                "焦点：修订视图   j/k 滚动   PgUp/PgDn 翻页   d/u 半页   g/G 首尾   v/Esc 返回记录   e 导出   ? 帮助   q 退出"
+                    .to_string()
+            } else {
+                format!(
+                    "焦点：修订视图   表格 {}/{}   Tab 选表   Enter 表格修订   j/k 滚动   PgUp/PgDn 翻页   v/Esc 返回记录   ? 帮助   q 退出",
+                    (app.revision_table_focus + 1).min(tables),
+                    tables
+                )
+            }
         }
         State::Ready(_) => match app.focus {
             Focus::Records => {
@@ -1800,7 +3038,18 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("v 在记录/修订视图间切换   Esc 返回记录"),
         Line::from("j/k 滚动   PgUp/PgDn 或 f/b 翻页   d/u 半页   g/G 首尾"),
         Line::from("删除段与移动原位用删除线，新增与修改的新文用下划线"),
-        Line::from("移动段新位置注明“移动自旧第 N 段”；表格差异暂不标记"),
+        Line::from("移动段新位置注明“移动自旧第 N 段”；表格显示为占位行，不展开"),
+        Line::from("Tab/Shift+Tab 选择表格   Enter 进入表格修订视图"),
+        Line::from(""),
+        Line::from(Span::styled("表格修订", Style::default().fg(Color::Yellow))),
+        Line::from("整表按对齐后的行列显示；筛选为“全部”时未变行也保留"),
+        Line::from("行首 + 新增 / - 删除 / ~ 修改 / > 移入 / < 移出；移动行在新旧位置各出现一次"),
+        Line::from("列有最小宽度，超宽时用 h/l 或 ←/→ 横向滚动（行号栏固定）"),
+        Line::from("Tab/Shift+Tab 循环筛选变更类型，1-6 直选（全部/修改/疑似/新增/删除/移动）"),
+        Line::from("↑↓/jk 选择行（高亮）   Enter 打开行详情，完整查看该行内容"),
+        Line::from("行详情：修改格按修订模式合并显示（删除线=旧片段，下划线=新片段）"),
+        Line::from("行详情：↑↓/jk 滚动   PgUp/PgDn 翻页   q/Esc/Enter 关闭"),
+        Line::from("[ / ] 切换表格   PgUp/PgDn 翻页选行   d/u 半页   g/G 首尾   v/Esc 返回修订"),
         Line::from(""),
         Line::from(Span::styled(
             "按 ? 或 Esc 关闭",
@@ -2004,6 +3253,7 @@ mod tests {
             old_tables: 0,
             new_tables: 0,
             records,
+            tables: Vec::new(),
             summary,
             semantic: crate::result::SemanticStatus::disabled("测试"),
             elapsed: Duration::from_millis(1),
@@ -2052,6 +3302,16 @@ mod tests {
         ])
     }
 
+    fn revision_output_with_table() -> CompareOutput {
+        let mut output = revision_output();
+        let mut grid = sample_grid();
+        grid.order = 1.5;
+        output.tables.push(grid);
+        output.old_tables = 1;
+        output.new_tables = 1;
+        output
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -2076,7 +3336,7 @@ mod tests {
     fn revision_view_marks_old_and_new_fragments() {
         let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
         app.apply(WorkerMsg::Done(Box::new(revision_output())));
-        let lines = revision_lines(&app.revision);
+        let lines = revision_lines(&app.revision, 100, None).0;
         let joined: String = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -2141,6 +3401,368 @@ mod tests {
     }
 
     #[test]
+    fn table_horizontal_scroll_keys_clamp_and_reset() {
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output_with_table())));
+        app.view = ViewMode::Table;
+        app.table_view = Some(sample_grid());
+        app.table_max_hscroll = 20;
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.table_hscroll, 4);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.table_hscroll, 8);
+        for _ in 0..10 {
+            app.handle_key(key(KeyCode::Char('l')));
+        }
+        assert_eq!(app.table_hscroll, 20);
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.table_hscroll, 16);
+
+        app.open_table_view();
+        assert_eq!(app.table_hscroll, 0, "重新进入表格视图应回到最左");
+        assert_eq!(app.table_max_hscroll, 0);
+    }
+
+    fn long_detail_table() -> TableGrid {
+        TableGrid {
+            table: 1,
+            caption: Some("整改台账".to_string()),
+            order: 0.0,
+            columns: vec![
+                column("事项", GridColumnKind::Unchanged),
+                column("整改措施", GridColumnKind::Unchanged),
+            ],
+            rows: vec![
+                GridRow {
+                    kind: GridRowKind::Modified,
+                    old_row: Some(30),
+                    new_row: Some(30),
+                    cells: vec![
+                        equal_cell("第30项"),
+                        changed_cell(
+                            "继续跟踪第30项，确保按期完成并每周报送进度",
+                            "继续跟踪第30项，确保按期完成，每周报送进度并附现场照片",
+                        ),
+                    ],
+                    note: None,
+                },
+                GridRow {
+                    kind: GridRowKind::Unchanged,
+                    old_row: Some(31),
+                    new_row: Some(31),
+                    cells: vec![equal_cell("第31项"), equal_cell("已完成")],
+                    note: None,
+                },
+            ],
+            summary: crate::result::Summary {
+                unchanged: 1,
+                modified: 1,
+                ..Default::default()
+            },
+            whole: None,
+        }
+    }
+
+    fn filter_sample_table() -> TableGrid {
+        let mut table = sample_grid();
+        table.columns = vec![
+            column("事项", GridColumnKind::Unchanged),
+            column("值", GridColumnKind::Unchanged),
+        ];
+        table.rows = vec![
+            GridRow {
+                kind: GridRowKind::Unchanged,
+                old_row: Some(2),
+                new_row: Some(2),
+                cells: vec![equal_cell("未变行"), equal_cell("0")],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::Modified,
+                old_row: Some(3),
+                new_row: Some(3),
+                cells: vec![equal_cell("修改行"), changed_cell("1", "2")],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::SuspectedModified,
+                old_row: Some(4),
+                new_row: Some(4),
+                cells: vec![equal_cell("疑似行"), changed_cell("1", "2")],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::Added,
+                old_row: None,
+                new_row: Some(5),
+                cells: vec![
+                    glyph_cell("新增行", GridCellKind::Added),
+                    glyph_cell("3", GridCellKind::Added),
+                ],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::Removed,
+                old_row: Some(6),
+                new_row: None,
+                cells: vec![
+                    glyph_cell("删除行", GridCellKind::Removed),
+                    glyph_cell("4", GridCellKind::Removed),
+                ],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::MovedTo,
+                old_row: Some(7),
+                new_row: Some(8),
+                cells: vec![
+                    glyph_cell("移入行", GridCellKind::Added),
+                    glyph_cell("5", GridCellKind::Added),
+                ],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::MovedFrom,
+                old_row: Some(7),
+                new_row: None,
+                cells: vec![
+                    glyph_cell("移出行", GridCellKind::Removed),
+                    glyph_cell("5", GridCellKind::Removed),
+                ],
+                note: None,
+            },
+        ];
+        table
+    }
+
+    #[test]
+    fn table_row_cursor_moves_and_scrolls() {
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output_with_table())));
+        app.view = ViewMode::Table;
+        let mut table = long_detail_table();
+        table.rows = (1..=10)
+            .map(|index| GridRow {
+                kind: GridRowKind::Unchanged,
+                old_row: Some(index),
+                new_row: Some(index),
+                cells: vec![equal_cell(&format!("第{index}项")), equal_cell("")],
+                note: None,
+            })
+            .collect();
+        app.table_view = Some(table);
+        app.reset_table_navigation();
+        app.table_page = 4;
+        app.table_max_scroll = 100;
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.table_selected, 1);
+        assert_eq!(app.table_scroll, 1, "选中行应保持在可视区内");
+
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.table_selected, 9);
+        assert_eq!(app.table_scroll, 9);
+
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.table_selected, 0);
+        assert_eq!(app.table_scroll, 3);
+
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.table_selected, 4);
+        assert_eq!(app.table_scroll, 4);
+    }
+
+    #[test]
+    fn table_filter_cycles_with_tab_and_numbers() {
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output_with_table())));
+        app.view = ViewMode::Table;
+        app.table_view = Some(filter_sample_table());
+        app.reset_table_navigation();
+        assert_eq!(app.table_filter, Filter::All);
+        assert_eq!(app.table_row_count(), 7);
+        assert_eq!(app.table_selected, 0);
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.table_filter, Filter::Modified);
+        assert_eq!(app.table_visible, vec![1]);
+        assert_eq!(app.table_selected, 0);
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.table_filter, Filter::Suspected);
+        assert_eq!(app.table_visible, vec![2]);
+
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.table_filter, Filter::Modified);
+
+        app.handle_key(key(KeyCode::Char('6')));
+        assert_eq!(app.table_filter, Filter::Moved);
+        assert_eq!(app.table_visible, vec![5, 6]);
+
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.table_filter, Filter::Added);
+        assert_eq!(app.table_visible, vec![3]);
+
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.table_filter, Filter::All);
+        assert_eq!(app.table_row_count(), 7);
+    }
+
+    #[test]
+    fn table_filter_labels_use_distinct_colors() {
+        let colors: Vec<Option<Color>> = Filter::ORDER
+            .iter()
+            .map(|filter| filter.style().fg)
+            .collect();
+        for (index, color) in colors.iter().enumerate() {
+            assert!(color.is_some(), "{colors:?}");
+            assert!(
+                !colors[..index].contains(color),
+                "各筛选类型应使用不同颜色: {colors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_view_filter_hides_other_rows_and_reports_empty() {
+        let table = filter_sample_table();
+        let visible = visible_table_rows(&table, Filter::Modified);
+        assert_eq!(visible, vec![1]);
+        let (lines, _) = table_view_lines(&table, 80, 0, &visible);
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("修改行"), "{text}");
+        for other in ["未变行", "疑似行", "新增行", "删除行", "移入行", "移出行"]
+        {
+            assert!(!text.contains(other), "筛选“修改”不应显示 {other}: {text}");
+        }
+
+        let sample = sample_grid();
+        let empty = visible_table_rows(&sample, Filter::Suspected);
+        assert!(empty.is_empty());
+        let (lines, _) = table_view_lines(&sample, 80, 0, &empty);
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("当前筛选无变化行"), "{text}");
+        assert!(!text.contains("售电量"), "{text}");
+    }
+
+    #[test]
+    fn brackets_switch_tables_while_tab_filters() {
+        let mut output = revision_output_with_table();
+        let mut second = sample_grid();
+        second.table = 2;
+        second.order = 2.0;
+        output.tables.push(second);
+
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(output)));
+        app.view = ViewMode::Table;
+        app.open_table_view();
+        assert_eq!(app.table_view.as_ref().unwrap().table, 1);
+
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(app.table_view.as_ref().unwrap().table, 2);
+        app.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(app.table_view.as_ref().unwrap().table, 1);
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.table_filter, Filter::Modified);
+        assert_eq!(app.table_view.as_ref().unwrap().table, 1, "Tab 不应再切表");
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(app.table_filter, Filter::Modified, "切表后应保留当前筛选");
+    }
+
+    #[test]
+    fn table_detail_shows_revision_style_diff() {
+        let table = long_detail_table();
+        let lines = table_detail_lines(&table, 0);
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("修改 · 第 30 行"), "{text}");
+        assert!(text.contains("整改措施"), "{text}");
+        assert!(text.contains("差异："), "{text}");
+        assert!(
+            text.contains("继续跟踪第30项，确保按期完成"),
+            "未变片段应保留: {text}"
+        );
+        assert!(text.contains("并附现场照片"), "新增片段应完整显示: {text}");
+        assert_eq!(
+            text.matches("继续跟踪第30项").count(),
+            1,
+            "未变前缀不应在旧值/新值里重复: {text}"
+        );
+        assert!(
+            !text.contains("旧：") && !text.contains("新："),
+            "修改格应合并成修订模式，而不是整行旧值/新值: {text}"
+        );
+        assert!(!text.contains('…'), "行详情不应截断: {text}");
+
+        let diff_line = lines
+            .iter()
+            .find(|line| line_text(line).contains("差异："))
+            .unwrap();
+        assert!(
+            diff_line
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::CROSSED_OUT)),
+            "删除片段应有删除线: {text}"
+        );
+        assert!(
+            diff_line
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::UNDERLINED)),
+            "新增片段应有下划线: {text}"
+        );
+    }
+
+    #[test]
+    fn table_detail_opens_closes_and_scrolls() {
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output_with_table())));
+        app.view = ViewMode::Table;
+        app.table_view = Some(long_detail_table());
+        app.reset_table_navigation();
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.table_detail, Some(0));
+        assert_eq!(app.table_detail_scroll, 0);
+
+        app.table_detail_page = 5;
+        app.table_detail_max = 20;
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.table_detail_scroll, 1);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.table_detail_scroll, 20);
+
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(app.table_detail, None, "q 应关闭行详情");
+        assert!(!app.quit, "行详情里的 q 不应退出程序");
+        assert_eq!(app.view, ViewMode::Table);
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.table_detail, Some(0));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.table_detail, None, "Enter 也应关闭行详情");
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.table_detail, None);
+        assert_eq!(app.view, ViewMode::Table, "关闭详情应留在表格视图");
+
+        app.table_view = Some(TableGrid {
+            rows: Vec::new(),
+            ..long_detail_table()
+        });
+        app.reset_table_navigation();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.table_detail, None, "空表不应打开行详情");
+
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.quit, "回到表格视图后 q 仍退出程序");
+    }
+
+    #[test]
     fn revision_view_renders_and_caches_wrapped_height() {
         use ratatui::backend::TestBackend;
 
@@ -2176,20 +3798,641 @@ mod tests {
             .collect()
     }
 
+    fn equal_cell(text: &str) -> GridCell {
+        GridCell {
+            old: Some(text.to_string()),
+            new: Some(text.to_string()),
+            diff: None,
+            kind: GridCellKind::Unchanged,
+        }
+    }
+
+    fn changed_cell(old: &str, new: &str) -> GridCell {
+        GridCell {
+            old: Some(old.to_string()),
+            new: Some(new.to_string()),
+            diff: Some(crate::diff::para_diff(old, new)),
+            kind: GridCellKind::Modified,
+        }
+    }
+
+    fn glyph_cell(text: &str, kind: GridCellKind) -> GridCell {
+        match kind {
+            GridCellKind::Added => GridCell {
+                old: None,
+                new: Some(text.to_string()),
+                diff: None,
+                kind,
+            },
+            GridCellKind::Removed => GridCell {
+                old: Some(text.to_string()),
+                new: None,
+                diff: None,
+                kind,
+            },
+            _ => equal_cell(text),
+        }
+    }
+
+    fn column(label: &str, kind: GridColumnKind) -> GridColumn {
+        GridColumn {
+            label: label.to_string(),
+            old_label: (kind != GridColumnKind::Added).then(|| label.to_string()),
+            old_index: (kind != GridColumnKind::Added).then_some(0),
+            new_index: (kind != GridColumnKind::Removed).then_some(0),
+            kind,
+        }
+    }
+
+    fn all_rows(table: &TableGrid) -> Vec<usize> {
+        (0..table.rows.len()).collect()
+    }
+
+    fn sample_grid() -> TableGrid {
+        TableGrid {
+            table: 1,
+            caption: Some("指标完成情况".to_string()),
+            order: 0.0,
+            columns: vec![
+                column("指标", GridColumnKind::Unchanged),
+                column("完成率", GridColumnKind::Unchanged),
+                column("备注", GridColumnKind::Added),
+            ],
+            rows: vec![
+                GridRow {
+                    kind: GridRowKind::Unchanged,
+                    old_row: Some(2),
+                    new_row: Some(2),
+                    cells: vec![
+                        equal_cell("售电量"),
+                        equal_cell("100"),
+                        glyph_cell("", GridCellKind::Unchanged),
+                    ],
+                    note: None,
+                },
+                GridRow {
+                    kind: GridRowKind::Modified,
+                    old_row: Some(3),
+                    new_row: Some(3),
+                    cells: vec![
+                        equal_cell("完成率"),
+                        changed_cell("80", "85"),
+                        glyph_cell("新增说明", GridCellKind::Added),
+                    ],
+                    note: None,
+                },
+                GridRow {
+                    kind: GridRowKind::Added,
+                    old_row: None,
+                    new_row: Some(4),
+                    cells: vec![
+                        glyph_cell("新指标", GridCellKind::Added),
+                        glyph_cell("1", GridCellKind::Added),
+                        glyph_cell("", GridCellKind::Added),
+                    ],
+                    note: None,
+                },
+            ],
+            summary: crate::result::Summary {
+                unchanged: 1,
+                added: 1,
+                modified: 1,
+                ..Default::default()
+            },
+            whole: None,
+        }
+    }
+
     #[test]
-    fn table_summary_marks_whole_table() {
-        let line = table_summary_line(&TableSummary {
+    fn revision_tables_open_in_a_dedicated_view() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output_with_table())));
+        app.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(app.view, ViewMode::Revision);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.revision_table_count(), 1);
+        assert_eq!(app.revision_table_lines.len(), 1);
+        let compact = screen_text(terminal.backend().buffer());
+        assert!(compact.contains("Enter查看表格修订"), "{compact}");
+        assert!(
+            !compact.contains("---+"),
+            "修订视图不应渲染表格网格: {compact}"
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.view, ViewMode::Table);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let compact = screen_text(terminal.backend().buffer());
+        assert!(compact.contains("表格修订"), "{compact}");
+        assert!(compact.contains("---+"), "{compact}");
+
+        app.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(app.view, ViewMode::Revision);
+        assert!(app.table_view.is_none());
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.view, ViewMode::Table);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.view, ViewMode::Revision);
+    }
+
+    fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut screen = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                screen.push_str(buffer[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        screen.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn table_view_renders_columns_rows_and_cell_marks() {
+        let table = sample_grid();
+        let (lines, _) = table_view_lines(&table, 80, 0, &all_rows(&table));
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            table_summary_text(&table).contains("未变 1 | 新增 1 | 修改 1"),
+            "{}",
+            table_summary_text(&table)
+        );
+        assert!(text.contains("|"), "{text}");
+        assert!(text.contains("---"), "{text}");
+        assert!(text.contains("+备注"), "{text}");
+        assert!(text.contains("指标"), "{text}");
+        assert!(text.contains("售电量"), "{text}");
+
+        let modified = lines
+            .iter()
+            .find(|line| line_text(line).contains("完成率") && line_text(line).contains("80"))
+            .unwrap();
+        assert!(line_text(modified).contains("~"), "{text}");
+        let deleted = modified
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "0")
+            .unwrap();
+        let inserted = modified
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "5")
+            .unwrap();
+        assert!(deleted.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(inserted.style.add_modifier.contains(Modifier::UNDERLINED));
+
+        let added = lines
+            .iter()
+            .find(|line| line_text(line).contains("新指标"))
+            .unwrap();
+        assert!(line_text(added).contains("+"), "{text}");
+
+        for line in &lines {
+            assert!(
+                UnicodeWidthStr::width(line_text(line).as_str()) <= 80,
+                "{}",
+                line_text(line)
+            );
+        }
+        let grid_widths: Vec<usize> = lines
+            .iter()
+            .map(|line| line_text(line))
+            .filter(|text| text.contains('|') || text.starts_with("------"))
+            .map(|text| UnicodeWidthStr::width(text.as_str()))
+            .collect();
+        assert!(
+            grid_widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "表头/分隔线/数据行应等宽: {grid_widths:?}\n{text}"
+        );
+    }
+
+    #[test]
+    fn table_placeholder_shows_entry_hint_only_when_focused() {
+        let table = sample_grid();
+        let idle = table_placeholder_line(&table, false, 120);
+        let idle_text = line_text(&idle);
+        assert!(idle_text.contains("表1（指标完成情况）"), "{idle_text}");
+        assert!(!idle_text.contains("Enter"), "{idle_text}");
+
+        let focused = table_placeholder_line(&table, true, 120);
+        let focused_text = line_text(&focused);
+        assert!(focused_text.starts_with("> "), "{focused_text}");
+        assert!(
+            focused_text.contains("Enter 查看表格修订"),
+            "{focused_text}"
+        );
+        assert!(UnicodeWidthStr::width(focused_text.as_str()) <= 120);
+        assert!(UnicodeWidthStr::width(focused_text.as_str()) >= 118);
+
+        let narrow = table_placeholder_line(&table, true, 8);
+        assert!(UnicodeWidthStr::width(line_text(&narrow).as_str()) <= 8);
+        assert!(line_text(&narrow).ends_with('…'));
+    }
+
+    #[test]
+    fn clip_line_keeps_prefix_and_ellipsis() {
+        let line = Line::from(vec![
+            Span::raw("▦ "),
+            Span::raw("表1（指标完成情况）"),
+            Span::raw("  未变 1"),
+        ]);
+        let clipped = clip_line(line, 16);
+        let text = line_text(&clipped);
+        assert_eq!(text, "▦ 表1（指标完成…", "{text}");
+    }
+
+    #[test]
+    fn clip_spans_keeps_prefix_before_the_ellipsis() {
+        let spans = text_spans(Some("继续跟踪第1项，确保按期完成"), DiffOp::Equal);
+        let text: String = clip_spans(&spans, 24)
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(text.starts_with("继续跟踪第1项"), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 24, "{text}");
+    }
+
+    #[test]
+    fn table_view_handles_unchanged_tables_and_narrow_width() {
+        let mut table = sample_grid();
+        table.summary = crate::result::Summary {
+            unchanged: 3,
+            ..Default::default()
+        };
+        table.columns = vec![column("指标", GridColumnKind::Unchanged)];
+        assert_eq!(table_summary_text(&table), "无变化");
+        let (lines, _) = table_view_lines(&table, 80, 0, &all_rows(&table));
+        assert!(lines.len() > 1, "表格修订视图仍显示完整网格");
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("标记："), "{text}");
+        assert!(text.contains("售电量"), "{text}");
+
+        let mut changed = sample_grid();
+        changed.summary = crate::result::Summary {
+            modified: 1,
+            ..Default::default()
+        };
+        let (lines, max_hscroll) = table_view_lines(&changed, 16, 0, &all_rows(&changed));
+        assert!(max_hscroll > 0, "窄终端应允许横向滚动");
+        for line in &lines {
+            assert!(UnicodeWidthStr::width(line_text(line).as_str()) <= 16);
+        }
+        let row_at =
+            |hscroll| line_text(&table_view_lines(&changed, 16, hscroll, &all_rows(&changed)).0[3]);
+        let first = row_at(0);
+        let scrolled = row_at(12);
+        assert_eq!(
+            first.chars().take(6).collect::<String>(),
+            scrolled.chars().take(6).collect::<String>(),
+            "行号栏应固定"
+        );
+        assert_ne!(first, scrolled, "横向滚动应改变可见列");
+    }
+
+    #[test]
+    fn table_view_keeps_min_column_width_and_scrolls_to_last_column() {
+        let columns: Vec<GridColumn> = (0..10)
+            .map(|index| column(&format!("指标{index}"), GridColumnKind::Unchanged))
+            .collect();
+        let cells: Vec<GridCell> = (0..10)
+            .map(|index| equal_cell(&format!("2026年数据{index}")))
+            .collect();
+        let table = TableGrid {
+            table: 1,
+            caption: None,
+            order: 0.0,
+            columns,
+            rows: vec![GridRow {
+                kind: GridRowKind::Unchanged,
+                old_row: Some(1),
+                new_row: Some(1),
+                cells,
+                note: None,
+            }],
+            summary: crate::result::Summary {
+                unchanged: 1,
+                ..Default::default()
+            },
+            whole: None,
+        };
+        assert!(
+            grid_widths(&table)
+                .iter()
+                .all(|width| *width >= GRID_MIN_COL),
+            "列宽不应被压到最小宽度以下: {:?}",
+            grid_widths(&table)
+        );
+
+        let (lines, max_hscroll) = table_view_lines(&table, 60, 0, &all_rows(&table));
+        assert!(max_hscroll > 0, "超宽表格应可横向滚动");
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !text.contains('…'),
+            "列有最小宽度后不应整列只剩省略号:\n{text}"
+        );
+        for line in &lines {
+            assert!(UnicodeWidthStr::width(line_text(line).as_str()) <= 60);
+        }
+
+        let (scrolled, _) = table_view_lines(&table, 60, max_hscroll, &all_rows(&table));
+        let scrolled_text: String = scrolled
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(scrolled_text.contains("指标9"), "{scrolled_text}");
+        assert!(scrolled_text.contains("2026年数据9"), "{scrolled_text}");
+        assert_eq!(
+            line_text(&lines[2]).chars().take(6).collect::<String>(),
+            line_text(&scrolled[2]).chars().take(6).collect::<String>(),
+            "行号栏在横向滚动时保持不动"
+        );
+    }
+
+    #[test]
+    fn table_view_shows_renamed_header() {
+        let table = TableGrid {
+            table: 1,
+            caption: None,
+            order: 0.0,
+            columns: vec![
+                column("指标", GridColumnKind::Unchanged),
+                GridColumn {
+                    label: "本期".to_string(),
+                    old_label: Some("本月".to_string()),
+                    old_index: Some(1),
+                    new_index: Some(1),
+                    kind: GridColumnKind::Unchanged,
+                },
+            ],
+            rows: vec![GridRow {
+                kind: GridRowKind::Unchanged,
+                old_row: Some(2),
+                new_row: Some(2),
+                cells: vec![equal_cell("销量"), equal_cell("1")],
+                note: None,
+            }],
+            summary: crate::result::Summary {
+                unchanged: 1,
+                ..Default::default()
+            },
+            whole: None,
+        };
+        assert!(table_summary_text(&table).contains("改列名 1"));
+        let (lines, _) = table_view_lines(&table, 80, 0, &all_rows(&table));
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("本月->本期"), "{text}");
+        assert!(text.contains("销量"), "{text}");
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|line| line_text(line))
+            .filter(|text| text.contains('|'))
+            .map(|text| UnicodeWidthStr::width(text.as_str()))
+            .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "改列名后表格行宽应一致: {widths:?}\n{text}"
+        );
+    }
+
+    #[test]
+    fn table_view_marks_whole_table_and_moved_rows() {
+        let mut whole = sample_grid();
+        whole.columns = vec![
+            column("甲", GridColumnKind::Removed),
+            column("乙", GridColumnKind::Removed),
+        ];
+        whole.summary = crate::result::Summary {
+            removed: 2,
+            ..Default::default()
+        };
+        whole.whole = Some(Status::Removed);
+        whole.rows = vec![
+            GridRow {
+                kind: GridRowKind::Removed,
+                old_row: Some(2),
+                new_row: None,
+                cells: vec![
+                    glyph_cell("甲", GridCellKind::Removed),
+                    glyph_cell("1", GridCellKind::Removed),
+                ],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::Removed,
+                old_row: Some(3),
+                new_row: None,
+                cells: vec![
+                    glyph_cell("乙", GridCellKind::Removed),
+                    glyph_cell("2", GridCellKind::Removed),
+                ],
+                note: None,
+            },
+        ];
+        assert_eq!(table_summary_text(&whole), "整表删除 | 共 2 行");
+        let (lines, _) = table_view_lines(&whole, 80, 0, &all_rows(&whole));
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("-甲"), "{text}");
+        assert!(text.contains("甲"), "{text}");
+        assert!(text.contains("乙"), "{text}");
+
+        let mut moved = sample_grid();
+        moved.columns = vec![column("指标", GridColumnKind::Unchanged)];
+        moved.summary = crate::result::Summary {
+            moved: 1,
+            unchanged: 1,
+            ..Default::default()
+        };
+        moved.rows = vec![
+            GridRow {
+                kind: GridRowKind::Unchanged,
+                old_row: Some(2),
+                new_row: Some(2),
+                cells: vec![equal_cell("甲")],
+                note: None,
+            },
+            GridRow {
+                kind: GridRowKind::MovedTo,
+                old_row: Some(4),
+                new_row: Some(3),
+                cells: vec![glyph_cell("丙", GridCellKind::Added)],
+                note: Some("移动自旧行 4".to_string()),
+            },
+            GridRow {
+                kind: GridRowKind::MovedFrom,
+                old_row: Some(4),
+                new_row: None,
+                cells: vec![glyph_cell("丙", GridCellKind::Removed)],
+                note: Some("移动至新行 3".to_string()),
+            },
+        ];
+        let (lines, _) = table_view_lines(&moved, 80, 0, &all_rows(&moved));
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("> 移入  < 移出"), "{text}");
+        assert!(text.contains("（移动：旧4->新3）"), "{text}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line_text(line).starts_with('>'))
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line_text(line).starts_with('<'))
+                .count(),
+            1
+        );
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|line| line_text(line))
+            .filter(|text| text.contains('|'))
+            .map(|text| UnicodeWidthStr::width(text.as_str()))
+            .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "表格行宽应一致: {widths:?}\n{text}"
+        );
+    }
+
+    #[test]
+    fn table_view_moved_rows_align_with_unchanged_rows() {
+        let table = TableGrid {
             table: 2,
             caption: None,
-            added: 0,
-            removed: 1,
-            modified: 0,
-            moved: 0,
-            whole: Some(Status::Removed),
-        });
-        let text = line_text(&line);
-        assert!(text.contains("整表删除"), "{text}");
-        assert!(!text.contains("删除 1 行"), "{text}");
+            order: 0.0,
+            columns: vec![
+                column("姓名", GridColumnKind::Unchanged),
+                column("部门", GridColumnKind::Unchanged),
+            ],
+            rows: vec![
+                GridRow {
+                    kind: GridRowKind::MovedTo,
+                    old_row: Some(4),
+                    new_row: Some(2),
+                    cells: vec![
+                        glyph_cell("丙", GridCellKind::Added),
+                        glyph_cell("营销部", GridCellKind::Added),
+                    ],
+                    note: None,
+                },
+                GridRow {
+                    kind: GridRowKind::Unchanged,
+                    old_row: Some(2),
+                    new_row: Some(3),
+                    cells: vec![equal_cell("甲"), equal_cell("办公室")],
+                    note: None,
+                },
+                GridRow {
+                    kind: GridRowKind::MovedFrom,
+                    old_row: Some(4),
+                    new_row: None,
+                    cells: vec![
+                        glyph_cell("丙", GridCellKind::Removed),
+                        glyph_cell("营销部", GridCellKind::Removed),
+                    ],
+                    note: None,
+                },
+            ],
+            summary: crate::result::Summary {
+                unchanged: 1,
+                moved: 1,
+                ..Default::default()
+            },
+            whole: None,
+        };
+        let (lines, _) = table_view_lines(&table, 120, 0, &all_rows(&table));
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|line| line_text(line))
+            .filter(|text| text.contains('|'))
+            .map(|text| UnicodeWidthStr::width(text.as_str()))
+            .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "移动行与普通行应等宽: {widths:?}\n{}",
+            lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+        );
+        let dividers: Vec<usize> = lines
+            .iter()
+            .map(|line| line_text(line))
+            .filter(|text| text.contains('|'))
+            .map(|text| {
+                let index = text.find('|').unwrap();
+                UnicodeWidthStr::width(&text[..index])
+            })
+            .collect();
+        assert!(
+            dividers.windows(2).all(|pair| pair[0] == pair[1]),
+            "列分隔线位置应一致: {dividers:?}\n{}",
+            lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn table_view_keeps_rows_aligned_for_multiline_cells() {
+        let table = TableGrid {
+            table: 1,
+            caption: None,
+            order: 0.0,
+            columns: vec![
+                column("事项", GridColumnKind::Unchanged),
+                column("说明", GridColumnKind::Unchanged),
+                column("结果", GridColumnKind::Unchanged),
+            ],
+            rows: vec![
+                GridRow {
+                    kind: GridRowKind::Modified,
+                    old_row: Some(2),
+                    new_row: Some(2),
+                    cells: vec![
+                        equal_cell("甲"),
+                        changed_cell("第一行\n第二行", "第一行\n第二行改"),
+                        equal_cell("正常"),
+                    ],
+                    note: None,
+                },
+                GridRow {
+                    kind: GridRowKind::Unchanged,
+                    old_row: Some(3),
+                    new_row: Some(3),
+                    cells: vec![equal_cell("乙"), equal_cell("单行"), equal_cell("正常")],
+                    note: None,
+                },
+            ],
+            summary: crate::result::Summary {
+                unchanged: 1,
+                modified: 1,
+                ..Default::default()
+            },
+            whole: None,
+        };
+        let (lines, _) = table_view_lines(&table, 80, 0, &all_rows(&table));
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            lines.iter().all(|line| !line_text(line).contains('\n')),
+            "单元格换行应转成空格: {text}"
+        );
+        assert!(text.contains("第一行 第二行改"), "{text}");
+        let bar_positions: Vec<Vec<usize>> = lines
+            .iter()
+            .map(|line| line_text(line))
+            .filter(|text| text.contains('|'))
+            .map(|text| {
+                text.match_indices('|')
+                    .map(|(index, _)| UnicodeWidthStr::width(&text[..index]))
+                    .collect()
+            })
+            .collect();
+        assert!(
+            bar_positions.windows(2).all(|pair| pair[0] == pair[1]),
+            "多段落单元格不应撑开竖线: {bar_positions:?}\n{text}"
+        );
     }
 
     #[test]
@@ -2224,6 +4467,7 @@ mod tests {
                 table: None,
                 order: 0.0,
             }],
+            tables: Vec::new(),
             summary: crate::result::Summary {
                 modified: 1,
                 ..Default::default()

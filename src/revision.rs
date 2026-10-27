@@ -1,6 +1,6 @@
-use crate::result::{DiffOp, ParaDiff, Record, Status, TableLocation};
+use crate::result::{DiffOp, ParaDiff, Record, Status, TableGrid};
 
-/// 修订视图中的块类型。正文以新文段落为骨架，删除与移动原位标记穿插其中。
+/// 修订视图中的块类型。正文以新文段落为骨架，表格块按整表网格渲染。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevisionKind {
     Unchanged,
@@ -19,18 +19,6 @@ pub struct RevisionSpan {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableSummary {
-    pub table: usize,
-    pub caption: Option<String>,
-    pub added: usize,
-    pub removed: usize,
-    pub modified: usize,
-    pub moved: usize,
-    /// 整表未配对时记录的新增/删除状态；此时行计数没有意义。
-    pub whole: Option<Status>,
-}
-
 #[derive(Debug, Clone)]
 pub struct RevisionBlock {
     pub kind: RevisionKind,
@@ -39,34 +27,32 @@ pub struct RevisionBlock {
     pub new_index: Option<usize>,
     pub note: Option<String>,
     pub spans: Vec<RevisionSpan>,
-    pub table: Option<TableSummary>,
+    pub table: Option<TableGrid>,
 }
 
 const POSITION_EPSILON: f64 = 1e-6;
 
-/// 把记录流整理成修订视图块。记录的 order 已经按新文阅读顺序排好，删除段在旧位置附近。
-pub fn build(records: &[Record]) -> Vec<RevisionBlock> {
+/// 把段落记录和表格网格整理成修订视图块。表格记录不再进入段落块。
+pub fn build(records: &[Record], tables: &[TableGrid]) -> Vec<RevisionBlock> {
     let mut blocks = Vec::new();
     let mut moved_from = Vec::new();
-    let mut tables: Vec<(f64, TableSummary)> = Vec::new();
 
     for record in records {
-        if let Some(location) = record.table.as_ref() {
-            push_table(&mut tables, location, record);
+        if record.table.is_some() {
             continue;
         }
         blocks.push(paragraph_block(record, &mut moved_from));
     }
-
-    blocks.extend(tables.into_iter().map(|(order, table)| RevisionBlock {
+    blocks.extend(tables.iter().map(|table| RevisionBlock {
         kind: RevisionKind::Table,
-        order,
+        order: table.order,
         old_index: None,
         new_index: None,
         note: None,
         spans: Vec::new(),
-        table: Some(table),
+        table: Some(table.clone()),
     }));
+
     place_moved_from(&mut blocks, moved_from);
     blocks.sort_by(|a, b| {
         a.order
@@ -151,34 +137,72 @@ pub fn merged_spans(record: &Record) -> Vec<RevisionSpan> {
 pub fn merge_diff(diff: &ParaDiff) -> Vec<RevisionSpan> {
     let mut spans = Vec::new();
     let (mut old_at, mut new_at) = (0usize, 0usize);
+    let (mut old_off, mut new_off) = (0usize, 0usize);
     while old_at < diff.old.len() || new_at < diff.new.len() {
-        match (diff.old.get(old_at), diff.new.get(new_at)) {
-            (Some(old), Some(new)) if old.op == DiffOp::Equal && new.op == DiffOp::Equal => {
-                // 两侧相等片段由同一个 TextDiff 生成，取新文一侧即可。
-                push_span(&mut spans, DiffOp::Equal, &new.text);
-                old_at += 1;
-                new_at += 1;
+        if old_at < diff.old.len() && old_off == diff.old[old_at].text.len() {
+            old_at += 1;
+            old_off = 0;
+            continue;
+        }
+        if new_at < diff.new.len() && new_off == diff.new[new_at].text.len() {
+            new_at += 1;
+            new_off = 0;
+            continue;
+        }
+        let old = diff.old.get(old_at);
+        let new = diff.new.get(new_at);
+        if let (Some(old), Some(new)) = (old, new)
+            && old.op == DiffOp::Equal
+            && new.op == DiffOp::Equal
+        {
+            // 两侧 Equal 片段的边界可能不同：旧文的删除会把新文一侧的相邻 Equal 合成一段。
+            // 只消费共同前缀，剩下的留给后续 Delete/Insert 对齐。
+            let old_text = &old.text[old_off..];
+            let new_text = &new.text[new_off..];
+            let common = common_prefix_len(old_text, new_text);
+            if common > 0 {
+                push_span(&mut spans, DiffOp::Equal, &new_text[..common]);
+                old_off += common;
+                new_off += common;
+                continue;
             }
+        }
+        match (old, new) {
             (Some(old), _) if old.op == DiffOp::Delete => {
-                push_span(&mut spans, DiffOp::Delete, &old.text);
+                push_span(&mut spans, DiffOp::Delete, &old.text[old_off..]);
                 old_at += 1;
+                old_off = 0;
             }
             (_, Some(new)) if new.op == DiffOp::Insert => {
-                push_span(&mut spans, DiffOp::Insert, &new.text);
+                push_span(&mut spans, DiffOp::Insert, &new.text[new_off..]);
                 new_at += 1;
+                new_off = 0;
             }
             (Some(old), _) => {
-                push_span(&mut spans, old.op, &old.text);
+                push_span(&mut spans, old.op, &old.text[old_off..]);
                 old_at += 1;
+                old_off = 0;
             }
             (_, Some(new)) => {
-                push_span(&mut spans, new.op, &new.text);
+                push_span(&mut spans, new.op, &new.text[new_off..]);
                 new_at += 1;
+                new_off = 0;
             }
             (None, None) => break,
         }
     }
     spans
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    let mut len = 0;
+    for (left, right) in a.chars().zip(b.chars()) {
+        if left != right {
+            break;
+        }
+        len += left.len_utf8();
+    }
+    len
 }
 
 fn spans_for(text: Option<&str>, op: DiffOp) -> Vec<RevisionSpan> {
@@ -203,48 +227,6 @@ fn push_span(spans: &mut Vec<RevisionSpan>, op: DiffOp, text: &str) {
         op,
         text: text.to_string(),
     });
-}
-
-fn push_table(tables: &mut Vec<(f64, TableSummary)>, location: &TableLocation, record: &Record) {
-    let index = match tables
-        .iter()
-        .position(|(_, summary)| summary.table == location.table)
-    {
-        Some(index) => index,
-        None => {
-            tables.push((
-                record.order,
-                TableSummary {
-                    table: location.table,
-                    caption: location.caption.clone(),
-                    added: 0,
-                    removed: 0,
-                    modified: 0,
-                    moved: 0,
-                    whole: None,
-                },
-            ));
-            tables.len() - 1
-        }
-    };
-    let (order, summary) = &mut tables[index];
-    *order = (*order).min(record.order);
-    if summary.caption.is_none() {
-        summary.caption = location.caption.clone();
-    }
-    if location.old_row.is_none()
-        && location.new_row.is_none()
-        && matches!(record.status, Status::Added | Status::Removed)
-    {
-        summary.whole = Some(record.status);
-    }
-    match record.status {
-        Status::Added => summary.added += 1,
-        Status::Removed => summary.removed += 1,
-        Status::Modified | Status::SuspectedModified => summary.modified += 1,
-        Status::Moved => summary.moved += 1,
-        Status::Unchanged => {}
-    }
 }
 
 /// 移动段在原位置补一个删除块：放在所有更早旧段落之后，没有更早段落则放在更晚段落之前。
@@ -296,7 +278,7 @@ fn kind_rank(kind: RevisionKind) -> u8 {
 mod tests {
     use super::*;
     use crate::diff::para_diff;
-    use crate::result::Scores;
+    use crate::result::{Scores, Summary, TableLocation};
 
     fn paragraph(
         status: Status,
@@ -350,7 +332,7 @@ mod tests {
             ),
         ];
 
-        let blocks = build(&records);
+        let blocks = build(&records, &[]);
         assert_eq!(
             kinds(&blocks),
             vec![
@@ -381,7 +363,7 @@ mod tests {
             1.0,
         )];
 
-        let blocks = build(&records);
+        let blocks = build(&records, &[]);
         assert_eq!(blocks.len(), 1);
         let spans = &blocks[0].spans;
         assert!(spans.iter().any(|span| span.op == DiffOp::Delete));
@@ -412,7 +394,7 @@ mod tests {
         );
         record.diff = None;
 
-        let blocks = build(&[record]);
+        let blocks = build(&[record], &[]);
         assert_eq!(
             blocks[0].spans,
             vec![
@@ -459,7 +441,7 @@ mod tests {
             ),
         ];
 
-        let blocks = build(&records);
+        let blocks = build(&records, &[]);
         let order: Vec<String> = blocks
             .iter()
             .map(|block| {
@@ -485,24 +467,6 @@ mod tests {
                     .position(|block| block.spans.first().is_some_and(|span| span.text == "丙"))
                     .unwrap(),
             "{order:?}"
-        );
-    }
-
-    #[test]
-    fn whole_table_record_is_marked_as_whole() {
-        let mut record = paragraph(Status::Removed, None, None, Some("甲 | 1"), None, 0.0);
-        record.table = Some(TableLocation {
-            table: 2,
-            old_row: None,
-            new_row: None,
-            caption: None,
-        });
-
-        let blocks = build(&[record]);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(
-            blocks[0].table.as_ref().unwrap().whole,
-            Some(Status::Removed)
         );
     }
 
@@ -537,7 +501,7 @@ mod tests {
             ),
         ];
 
-        let blocks = build(&records);
+        let blocks = build(&records, &[]);
         let first_with_text = |text: &str| {
             blocks
                 .iter()
@@ -559,33 +523,103 @@ mod tests {
     }
 
     #[test]
-    fn table_rows_are_grouped_into_one_summary_block() {
-        let location = |row: usize| TableLocation {
-            table: 1,
-            old_row: None,
-            new_row: Some(row),
-            caption: Some("指标完成情况".to_string()),
-        };
-        let mut added = paragraph(Status::Added, None, None, None, Some("甲 | 1"), 1.0);
-        added.table = Some(location(2));
-        let mut removed = paragraph(Status::Removed, None, None, Some("乙 | 2"), None, 1.0);
-        removed.table = Some(location(3));
-        let mut modified = paragraph(
+    fn table_records_do_not_become_paragraphs() {
+        let mut table_record = paragraph(
             Status::Modified,
             None,
             None,
-            Some("丙 | 3"),
-            Some("丙 | 4"),
+            Some("甲 | 1"),
+            Some("甲 | 2"),
             1.0,
         );
-        modified.table = Some(location(4));
+        table_record.table = Some(TableLocation {
+            table: 1,
+            old_row: Some(2),
+            new_row: Some(2),
+            caption: None,
+        });
+        let grid = TableGrid {
+            table: 1,
+            caption: None,
+            order: 1.0,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            summary: Summary::default(),
+            whole: None,
+        };
 
-        let blocks = build(&[added, removed, modified]);
+        let blocks = build(&[table_record], &[grid]);
         assert_eq!(blocks.len(), 1);
-        let table = blocks[0].table.as_ref().unwrap();
-        assert_eq!(table.added, 1);
-        assert_eq!(table.removed, 1);
-        assert_eq!(table.modified, 1);
-        assert_eq!(table.caption.as_deref(), Some("指标完成情况"));
+        assert_eq!(blocks[0].kind, RevisionKind::Table);
+        assert!(blocks[0].table.is_some());
+    }
+
+    fn merged_diff(old: &str, new: &str) -> Vec<RevisionSpan> {
+        merge_diff(&para_diff(old, new))
+    }
+
+    fn span_text(spans: &[RevisionSpan], op: DiffOp) -> String {
+        spans
+            .iter()
+            .filter(|span| span.op == op)
+            .map(|span| span.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn merge_diff_keeps_repeated_sentences_in_order() {
+        let old = "公司部门（机构）人员编制及内部机构设置和调整的个别设置和调整、；公司所属单位机构编制管理重要调整事项。方案；公司所属单位机构编制管理重要调整事项。";
+        let new = "公司部门（机构）人员编制及内部机构设置和调整事项；公司所属单位机构编制管理重要调整事项。公司所属单位机构编制管理重要调整事项。";
+        let spans = merged_diff(old, new);
+        assert_eq!(
+            span_text(&spans, DiffOp::Delete),
+            "的个别设置和调整、方案；"
+        );
+        assert_eq!(span_text(&spans, DiffOp::Insert), "事项");
+
+        let merged: String = spans.iter().map(|span| span.text.as_str()).collect();
+        let sentence = "公司所属单位机构编制管理重要调整事项。";
+        let positions: Vec<usize> = merged.match_indices(sentence).map(|(at, _)| at).collect();
+        assert_eq!(positions.len(), 2, "重复句不应被多打印: {merged}");
+        let deleted_at = merged.find("方案；").unwrap();
+        assert!(
+            positions[0] < deleted_at && deleted_at < positions[1],
+            "删除片段应留在两句之间: {merged}"
+        );
+
+        let old_text: String = spans
+            .iter()
+            .filter(|span| span.op != DiffOp::Insert)
+            .map(|span| span.text.as_str())
+            .collect();
+        let new_text: String = spans
+            .iter()
+            .filter(|span| span.op != DiffOp::Delete)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(old_text, old);
+        assert_eq!(new_text, new);
+    }
+
+    #[test]
+    fn merge_diff_keeps_equal_word_when_old_already_has_it() {
+        let old = "公司部门（机构）人员编制及内部机构设置和调整的个别设置和调整、事项；公司所属单位机构编制管理重要调整事项。方案；公司所属单位机构编制管理重要调整事项。";
+        let new = "公司部门（机构）人员编制及内部机构设置和调整事项；公司所属单位机构编制管理重要调整事项。公司所属单位机构编制管理重要调整事项。";
+        let spans = merged_diff(old, new);
+        assert_eq!(
+            span_text(&spans, DiffOp::Delete),
+            "的个别设置和调整、方案；"
+        );
+        assert_eq!(span_text(&spans, DiffOp::Insert), "");
+
+        let merged: String = spans.iter().map(|span| span.text.as_str()).collect();
+        let sentence = "公司所属单位机构编制管理重要调整事项。";
+        let positions: Vec<usize> = merged.match_indices(sentence).map(|(at, _)| at).collect();
+        assert_eq!(positions.len(), 2, "重复句不应被多打印: {merged}");
+        let deleted_at = merged.find("方案；").unwrap();
+        assert!(
+            positions[0] < deleted_at && deleted_at < positions[1],
+            "删除片段应留在两句之间: {merged}"
+        );
     }
 }

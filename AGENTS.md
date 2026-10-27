@@ -13,7 +13,7 @@
   cargo test
   ```
 
-代码入口按引擎分开：`src/engine/mod.rs` 根据扩展名检测 `DocumentKind` 并分发；Word 在 `src/engine/docx.rs`，Excel 在 `src/xlsx/`；TUI 在 `src/tui/`（`entry.rs` 类型选择、`picker.rs` 文件选择、`xlsx.rs` Excel 网格）；Word 修订视图模型在 `src/revision.rs`。`cargo test` 会在 `target/xlsx-test/` 下临时生成最小工作簿测试 Excel 读取与对齐，不需要提交二进制测试文件。
+代码入口按引擎分开：`src/engine/mod.rs` 根据扩展名检测 `DocumentKind` 并分发；Word 在 `src/engine/docx.rs`，Excel 在 `src/xlsx/`；TUI 在 `src/tui/`（`entry.rs` 类型选择、`picker.rs` 文件选择、`xlsx.rs` Excel 网格）；Word 修订视图模型在 `src/revision.rs`（段落按新文顺序成块，表格以 `result::TableGrid` 进入修订流；TUI 修订视图只显示表格占位行，按 Tab 选中、Enter 进入单独的表格修订视图渲染网格，网格内 Tab 筛选变更类型、j/k 选行、Enter 打开行详情看完整旧/新值、[ ] 切表）。`cargo test` 会在 `target/xlsx-test/` 下临时生成最小工作簿测试 Excel 读取与对齐，不需要提交二进制测试文件。
 
 ## 2. 模型不在 git 里
 

@@ -69,12 +69,13 @@ pub fn compare(
     );
 
     progress(Progress::Stage("表格匹配".to_string()));
-    records.extend(matching::table::match_tables(
+    let (table_records, tables) = matching::table::match_tables(
         &old.tables,
         &new.tables,
         config,
         prepared.as_ref().map(|value| &value.tables),
-    ));
+    );
+    records.extend(table_records);
     records.sort_by(|a, b| a.order.total_cmp(&b.order));
     for (index, record) in records.iter_mut().enumerate() {
         record.id = index + 1;
@@ -125,6 +126,7 @@ pub fn compare(
         old_tables: old.tables.len(),
         new_tables: new.tables.len(),
         records,
+        tables,
         summary,
         semantic: semantic_status,
         elapsed,
