@@ -8,6 +8,7 @@ mod model;
 mod normalize;
 mod report;
 mod result;
+mod revision;
 mod tui;
 mod xlsx;
 
@@ -27,7 +28,7 @@ use model::download;
     name = "diffract",
     version,
     about = "diffRact：本地 .docx / .xlsx 版本比较工具",
-    long_about = "比较两个 .docx 的段落与表格行，或两个 .xlsx/.xlsm 的工作表、行列与单元格，识别未变、新增、删除、修改、移动、疑似修改六类差异。默认进入 TUI；省略文件参数时先选择 Word/Excel 再进入文件选择器；--check 用于 CI 和批处理（Word 还支持 --html/--md）。使用 download-model 子命令可显式下载语义模型（仅该命令联网）。",
+    long_about = "比较两个 .docx 的段落与表格行，或两个 .xlsx/.xlsm 的工作表、行列与单元格，识别未变、新增、删除、修改、移动、疑似修改六类差异。默认进入 TUI；Word TUI 可按 v 切换以新文段落为骨架的修订视图；省略文件参数时先选择 Word/Excel 再进入文件选择器；--check 用于 CI 和批处理（Word 还支持 --html/--md）。使用 download-model 子命令可显式下载语义模型（仅该命令联网）。",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {

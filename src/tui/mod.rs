@@ -26,6 +26,7 @@ use crate::engine::DocumentKind;
 use crate::matching::Progress;
 use crate::report;
 use crate::result::{CompareOutput, DiffOp, DiffSpan, Record, Status};
+use crate::revision::{self, RevisionBlock, RevisionKind, TableSummary};
 
 mod entry;
 mod picker;
@@ -54,6 +55,14 @@ struct DetailMetrics {
     height: u16,
     old_max: u16,
     new_max: u16,
+}
+
+/// 修订视图整篇换行行数的缓存，只在终端尺寸变化时重算。
+#[derive(Debug, Clone, Copy)]
+struct RevisionMetrics {
+    width: u16,
+    height: u16,
+    max: u16,
 }
 
 enum State {
@@ -137,6 +146,12 @@ impl Filter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Records,
+    Revision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Records,
     Detail(DetailPane),
@@ -199,6 +214,7 @@ struct App {
     old: PathBuf,
     new: PathBuf,
     state: State,
+    view: ViewMode,
     filter: Filter,
     selected: usize,
     table_state: TableState,
@@ -219,6 +235,11 @@ struct App {
     /// 记录列表预览在比较完成时预计算，避免每帧复制所有记录的完整原文。
     previews: Vec<String>,
     detail_metrics: Option<DetailMetrics>,
+    revision: Vec<RevisionBlock>,
+    revision_scroll: u16,
+    revision_max_scroll: u16,
+    revision_page: u16,
+    revision_metrics: Option<RevisionMetrics>,
 }
 
 impl App {
@@ -232,6 +253,7 @@ impl App {
                 stage: "准备比较".to_string(),
                 step: None,
             },
+            view: ViewMode::Records,
             filter: Filter::All,
             selected: 0,
             table_state,
@@ -251,6 +273,11 @@ impl App {
             context_chars,
             previews: Vec::new(),
             detail_metrics: None,
+            revision: Vec::new(),
+            revision_scroll: 0,
+            revision_max_scroll: 0,
+            revision_page: 1,
+            revision_metrics: None,
         }
     }
 
@@ -276,12 +303,17 @@ impl App {
                     .iter()
                     .map(|record| record_preview(record, 120))
                     .collect();
+                self.revision = revision::build(&output.records);
                 self.state = State::Ready(output);
+                self.view = ViewMode::Records;
                 self.selected = 0;
                 self.table_state.select(Some(0));
                 self.focus = Focus::Records;
                 self.reset_detail_scroll();
                 self.detail_metrics = None;
+                self.revision_scroll = 0;
+                self.revision_max_scroll = 0;
+                self.revision_metrics = None;
                 self.expanded = false;
                 self.status = Some(StatusMessage {
                     text: "比较完成".to_string(),
@@ -453,9 +485,57 @@ impl App {
             self.handle_dialog_key(key);
             return;
         }
+        if matches!(self.state, State::Ready(_))
+            && matches!(key.code, KeyCode::Char('v'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.toggle_view();
+            return;
+        }
+        if self.view == ViewMode::Revision {
+            self.handle_revision_key(key);
+            return;
+        }
         match self.focus {
             Focus::Records => self.handle_records_key(key),
             Focus::Detail(_) => self.handle_detail_key(key),
+        }
+    }
+
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            ViewMode::Records => ViewMode::Revision,
+            ViewMode::Revision => ViewMode::Records,
+        };
+    }
+
+    fn scroll_revision(&mut self, delta: isize) {
+        let current = self.revision_scroll as isize;
+        let max = self.revision_max_scroll as isize;
+        self.revision_scroll = current.saturating_add(delta).clamp(0, max) as u16;
+    }
+
+    fn handle_revision_key(&mut self, key: KeyEvent) {
+        let page = self.revision_page.max(1) as isize;
+        let half = (page / 2).max(1);
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => self.view = ViewMode::Records,
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('e') => self.open_export(),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_revision(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_revision(1),
+            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_revision(-page),
+            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
+                self.scroll_revision(page);
+            }
+            KeyCode::Char('u') => self.scroll_revision(-half),
+            KeyCode::Char('d') => self.scroll_revision(half),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_revision(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_revision(isize::MAX / 2),
+            _ => {}
         }
     }
 
@@ -884,6 +964,11 @@ fn draw_ready(frame: &mut Frame, area: Rect, app: &mut App) {
     let State::Ready(output) = &app.state else {
         return;
     };
+    if app.view == ViewMode::Revision {
+        draw_revision_bar(frame, layout[0], output);
+        draw_revision(frame, layout[1], app);
+        return;
+    }
     let context_chars = app.context_chars;
     let records_focused = matches!(app.focus, Focus::Records);
     let mut filter_spans = Vec::new();
@@ -992,6 +1077,278 @@ fn draw_ready(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     draw_detail(frame, columns[1], app, context_chars);
+}
+
+fn draw_revision_bar(frame: &mut Frame, area: Rect, output: &CompareOutput) {
+    let summary = &output.summary;
+    let separator = || Span::styled(" · ", Style::default().fg(Color::DarkGray));
+    let spans = vec![
+        Span::styled(
+            "修订视图",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  以新文段落为骨架  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("未变 {}", summary.unchanged),
+            Style::default().fg(Color::DarkGray),
+        ),
+        separator(),
+        Span::styled(
+            format!("修改 {}", summary.modified),
+            Style::default().fg(Color::Yellow),
+        ),
+        separator(),
+        Span::styled(
+            format!("疑似 {}", summary.suspected_modified),
+            Style::default().fg(Color::Magenta),
+        ),
+        separator(),
+        Span::styled(
+            format!("新增 {}", summary.added),
+            Style::default().fg(Color::Green),
+        ),
+        separator(),
+        Span::styled(
+            format!("删除 {}", summary.removed),
+            Style::default().fg(Color::Red),
+        ),
+        separator(),
+        Span::styled(
+            format!("移动 {}", summary.moved),
+            Style::default().fg(Color::Cyan),
+        ),
+    ];
+    let bar = Layout::horizontal([Constraint::Min(0), Constraint::Length(16)]).split(area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), bar[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "v/Esc 返回记录",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Right),
+        bar[1],
+    );
+}
+
+fn draw_revision(frame: &mut Frame, area: Rect, app: &mut App) {
+    let lines = revision_lines(&app.revision);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                "修订",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " · 新文骨架（删除线=旧文，下划线=新文）",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let cached = app
+        .revision_metrics
+        .filter(|metrics| metrics.width == inner.width && metrics.height == inner.height);
+    let max = cached.map(|metrics| metrics.max).unwrap_or_else(|| {
+        let total = paragraph.line_count(inner.width);
+        total
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16
+    });
+    let scroll = app.revision_scroll.min(max);
+    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
+    app.revision_scroll = scroll;
+    app.revision_max_scroll = max;
+    app.revision_page = inner.height;
+    if cached.is_none() {
+        app.revision_metrics = Some(RevisionMetrics {
+            width: inner.width,
+            height: inner.height,
+            max,
+        });
+    }
+}
+
+fn revision_lines(blocks: &[RevisionBlock]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        append_revision_block(&mut lines, block);
+    }
+    lines
+}
+
+fn append_revision_block(lines: &mut Vec<Line<'static>>, block: &RevisionBlock) {
+    if block.kind == RevisionKind::Table {
+        if let Some(table) = block.table.as_ref() {
+            lines.push(table_summary_line(table));
+        }
+        return;
+    }
+
+    let (tag, style) = revision_tag(block);
+    let mut current = Line::from(vec![Span::styled(tag, style)]);
+    if let Some(note) = block.note.as_ref() {
+        current.spans.push(Span::styled(
+            format!("（{note}）"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    current.spans.push(Span::raw(" "));
+    for span in &block.spans {
+        let span_style = revision_span_style(span.op);
+        for (index, part) in span.text.split('\n').enumerate() {
+            if index > 0 {
+                lines.push(current);
+                current = Line::from("");
+            }
+            if !part.is_empty() {
+                current
+                    .spans
+                    .push(Span::styled(part.to_string(), span_style));
+            }
+        }
+    }
+    lines.push(current);
+}
+
+fn revision_tag(block: &RevisionBlock) -> (String, Style) {
+    let old = block
+        .old_index
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let new = block
+        .new_index
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    match block.kind {
+        RevisionKind::Unchanged => (format!("  新{new} "), Style::default().fg(Color::DarkGray)),
+        RevisionKind::Added => (
+            format!("+ 新增 新{new} "),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RevisionKind::Removed => (
+            format!("- 删除 旧{old} "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        RevisionKind::Modified => (
+            format!("~ 修改 旧{old}→新{new} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RevisionKind::SuspectedModified => (
+            format!("~ 疑似修改 旧{old}→新{new} "),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RevisionKind::MovedFrom => (
+            format!("- 移动 旧{old} "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        RevisionKind::MovedTo => (
+            format!("+ 移动 新{new} "),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RevisionKind::Table => ("  ".to_string(), Style::default()),
+    }
+}
+
+fn revision_span_style(op: DiffOp) -> Style {
+    match op {
+        DiffOp::Equal => Style::default(),
+        DiffOp::Delete => Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::CROSSED_OUT),
+        DiffOp::Insert => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::UNDERLINED),
+    }
+}
+
+fn table_summary_line(table: &TableSummary) -> Line<'static> {
+    let label = match table.caption.as_ref() {
+        Some(caption) => {
+            let caption = caption.replace(['\n', '\t'], " ");
+            let caption = caption.trim();
+            if caption.is_empty() {
+                format!("表{}", table.table)
+            } else if caption.starts_with('表') {
+                caption.to_string()
+            } else {
+                format!("表{}（{caption}）", table.table)
+            }
+        }
+        None => format!("表{}", table.table),
+    };
+    let mut spans = vec![
+        Span::styled(
+            "▦ ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut counts = Vec::new();
+    if table.whole.is_some() {
+        counts.push(
+            match table.whole {
+                Some(Status::Added) => "整表新增",
+                Some(Status::Removed) => "整表删除",
+                _ => "整表变化",
+            }
+            .to_string(),
+        );
+    } else {
+        if table.added > 0 {
+            counts.push(format!("新增 {} 行", table.added));
+        }
+        if table.removed > 0 {
+            counts.push(format!("删除 {} 行", table.removed));
+        }
+        if table.modified > 0 {
+            counts.push(format!("修改 {} 行", table.modified));
+        }
+        if table.moved > 0 {
+            counts.push(format!("移动 {} 行", table.moved));
+        }
+        if counts.is_empty() {
+            counts.push("无变化行".to_string());
+        }
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        counts.join(" · "),
+        Style::default().fg(Color::Yellow),
+    ));
+    spans.push(Span::styled(
+        "（表格内容差异暂未标记）",
+        Style::default().fg(Color::DarkGray),
+    ));
+    Line::from(spans)
 }
 
 fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, context_chars: usize) {
@@ -1380,13 +1737,17 @@ fn spans_lines(spans: &[DiffSpan]) -> Vec<Line<'static>> {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
     let keys = match app.state {
+        State::Ready(_) if app.view == ViewMode::Revision => {
+            "焦点：修订视图   j/k 滚动   PgUp/PgDn 翻页   d/u 半页   g/G 首尾   v/Esc 返回记录   e 导出   ? 帮助   q 退出"
+                .to_string()
+        }
         State::Ready(_) => match app.focus {
             Focus::Records => {
-                "焦点：记录   ↑↓/jk 选择   Enter 详情   Tab/1-6 筛选   Space 展开   e 导出   ? 帮助   q 退出"
+                "焦点：记录   ↑↓/jk 选择   Enter 详情   v 修订视图   Tab/1-6 筛选   Space 展开   e 导出   ? 帮助   q 退出"
                     .to_string()
             }
             Focus::Detail(pane) => format!(
-                "焦点：详情/{}   Tab 切栏   j/k 滚动   [ ] 细调   Enter 展开   q/Esc 返回",
+                "焦点：详情/{}   Tab 切栏   j/k 滚动   [ ] 细调   Enter 展开   v 修订视图   q/Esc 返回",
                 pane.label()
             ),
         },
@@ -1413,7 +1774,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let rect = centered_rect(72, 78, area);
+    let rect = centered_rect(76, 86, area);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::from(Span::styled(
@@ -1434,6 +1795,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("↑↓/jk 或 [ ] 滚动当前栏   { } 一次十行"),
         Line::from("Enter/Space 展开或收起   e 导出"),
         Line::from("q/Esc 返回记录列表"),
+        Line::from(""),
+        Line::from(Span::styled("修订视图", Style::default().fg(Color::Yellow))),
+        Line::from("v 在记录/修订视图间切换   Esc 返回记录"),
+        Line::from("j/k 滚动   PgUp/PgDn 或 f/b 翻页   d/u 半页   g/G 首尾"),
+        Line::from("删除段与移动原位用删除线，新增与修改的新文用下划线"),
+        Line::from("移动段新位置注明“移动自旧第 N 段”；表格差异暂不标记"),
         Line::from(""),
         Line::from(Span::styled(
             "按 ? 或 Esc 关闭",
@@ -1597,6 +1964,232 @@ mod tests {
         assert!(Filter::All.matches(Status::Unchanged));
         assert!(!Filter::Modified.matches(Status::SuspectedModified));
         assert_eq!(Filter::from_number('3'), Some(Filter::Suspected));
+    }
+
+    fn sample_record(
+        id: usize,
+        status: Status,
+        old: Option<usize>,
+        new: Option<usize>,
+        old_text: Option<&str>,
+        new_text: Option<&str>,
+        order: f64,
+    ) -> Record {
+        Record {
+            id,
+            status,
+            old_para_index: old,
+            new_para_index: new,
+            old_text: old_text.map(str::to_string),
+            new_text: new_text.map(str::to_string),
+            scores: crate::result::Scores::empty(),
+            diff: status
+                .is_modified_like()
+                .then(|| crate::diff::para_diff(old_text.unwrap_or(""), new_text.unwrap_or(""))),
+            row_diff: None,
+            matched_to: new,
+            note: None,
+            table: None,
+            order,
+        }
+    }
+
+    fn sample_output(records: Vec<Record>) -> CompareOutput {
+        let summary = crate::result::Summary::from_records(&records);
+        CompareOutput {
+            old_path: PathBuf::from("old.docx"),
+            new_path: PathBuf::from("new.docx"),
+            old_paragraphs: 4,
+            new_paragraphs: 4,
+            old_tables: 0,
+            new_tables: 0,
+            records,
+            summary,
+            semantic: crate::result::SemanticStatus::disabled("测试"),
+            elapsed: Duration::from_millis(1),
+        }
+    }
+
+    fn revision_output() -> CompareOutput {
+        sample_output(vec![
+            sample_record(
+                1,
+                Status::Unchanged,
+                Some(1),
+                Some(1),
+                Some("甲段"),
+                Some("甲段"),
+                0.0,
+            ),
+            sample_record(
+                2,
+                Status::Removed,
+                Some(2),
+                None,
+                Some("乙段旧文"),
+                None,
+                0.5,
+            ),
+            sample_record(
+                3,
+                Status::Modified,
+                Some(3),
+                Some(2),
+                Some("公司每年检查"),
+                Some("公司每季度检查"),
+                1.0,
+            ),
+            sample_record(
+                4,
+                Status::Moved,
+                Some(4),
+                Some(3),
+                Some("戊段"),
+                Some("戊段"),
+                2.0,
+            ),
+            sample_record(5, Status::Added, None, Some(4), None, Some("丁段新增"), 3.0),
+        ])
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn v_switches_between_records_and_revision() {
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output())));
+        assert_eq!(app.view, ViewMode::Records);
+        assert_eq!(app.revision.len(), 6);
+
+        app.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(app.view, ViewMode::Revision);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.view, ViewMode::Records);
+        app.handle_key(key(KeyCode::Char('v')));
+        app.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(app.view, ViewMode::Records);
+    }
+
+    #[test]
+    fn revision_view_marks_old_and_new_fragments() {
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output())));
+        let lines = revision_lines(&app.revision);
+        let joined: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(joined.contains("移动自旧第 4 段"), "{joined}");
+        assert!(joined.contains("移动至新第 3 段"), "{joined}");
+        assert!(joined.contains("年"), "{joined}");
+        assert!(joined.contains("季度"), "{joined}");
+
+        let modified = lines
+            .iter()
+            .find(|line| line_text(line).contains("修改 旧3→新2"))
+            .unwrap();
+        let deleted = modified
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "年")
+            .unwrap();
+        let inserted = modified
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "季度")
+            .unwrap();
+        assert!(deleted.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(inserted.style.add_modifier.contains(Modifier::UNDERLINED));
+
+        let removed = lines
+            .iter()
+            .find(|line| line_text(line).contains("- 删除 旧2"))
+            .unwrap();
+        assert!(
+            removed
+                .spans
+                .iter()
+                .find(|span| span.content.contains("乙段旧文"))
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+    }
+
+    #[test]
+    fn revision_scroll_keys_clamp_and_page() {
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output())));
+        app.handle_key(key(KeyCode::Char('v')));
+        app.revision_max_scroll = 20;
+        app.revision_page = 5;
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.revision_scroll, 1);
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.revision_scroll, 6);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.revision_scroll, 20);
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.revision_scroll, 20);
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.revision_scroll, 0);
+    }
+
+    #[test]
+    fn revision_view_renders_and_caches_wrapped_height() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(PathBuf::from("old.docx"), PathBuf::from("new.docx"), 80);
+        app.apply(WorkerMsg::Done(Box::new(revision_output())));
+        app.handle_key(key(KeyCode::Char('v')));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                screen.push_str(buffer[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        let compact: String = screen.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("修订视图"), "{screen}");
+        assert!(compact.contains("新增"), "{screen}");
+        assert!(compact.contains("删除"), "{screen}");
+        assert!(app.revision_metrics.is_some());
+
+        app.revision_scroll = 999;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.revision_scroll <= app.revision_max_scroll);
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn table_summary_marks_whole_table() {
+        let line = table_summary_line(&TableSummary {
+            table: 2,
+            caption: None,
+            added: 0,
+            removed: 1,
+            modified: 0,
+            moved: 0,
+            whole: Some(Status::Removed),
+        });
+        let text = line_text(&line);
+        assert!(text.contains("整表删除"), "{text}");
+        assert!(!text.contains("删除 1 行"), "{text}");
     }
 
     #[test]
