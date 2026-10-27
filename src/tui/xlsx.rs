@@ -48,6 +48,14 @@ enum ViewMode {
     List,
 }
 
+/// 最上层的浮层；开、关或互相切换时强制重绘一帧空白格，清掉宽字符尾列残留的底色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    Help,
+    RowDetail,
+}
+
 struct App {
     old: PathBuf,
     new: PathBuf,
@@ -72,6 +80,12 @@ struct App {
     flash: Option<(usize, usize, usize, Instant)>,
     notice: Option<(String, Instant)>,
     help: bool,
+    /// 整行对比浮层打开时记录的行下标。
+    row_detail: Option<usize>,
+    row_detail_scroll: u16,
+    row_detail_max: u16,
+    row_detail_page: u16,
+    last_overlay: Overlay,
     quit: bool,
     fatal: bool,
     started: Instant,
@@ -109,6 +123,11 @@ impl App {
             flash: None,
             notice: None,
             help: false,
+            row_detail: None,
+            row_detail_scroll: 0,
+            row_detail_max: 0,
+            row_detail_page: 1,
+            last_overlay: Overlay::None,
             quit: false,
             fatal: false,
             started: Instant::now(),
@@ -144,6 +163,7 @@ impl App {
                 self.normalize_grid_row();
                 self.rebuild_changes();
                 self.reset_change_anchor = true;
+                self.close_row_detail();
             }
             WorkerMsg::Failed(error) => {
                 log::error!("Excel 比较失败：{error}");
@@ -228,6 +248,7 @@ impl App {
         self.normalize_grid_row();
         self.rebuild_changes();
         self.reset_change_anchor = true;
+        self.close_row_detail();
     }
 
     fn filtered_cells(&self) -> Vec<(usize, usize)> {
@@ -502,6 +523,7 @@ impl App {
         self.rebuild_changes();
         self.reset_change_anchor = true;
         self.normalize_grid_row();
+        self.close_row_detail();
         if self.changes.is_empty() {
             self.set_notice("当前筛选无变化");
             return;
@@ -596,6 +618,59 @@ impl App {
         self.notice = None;
     }
 
+    /// 当前最上层的浮层。`draw` 用它判断浮层是否刚开合过。
+    fn overlay(&self) -> Overlay {
+        if self.help {
+            Overlay::Help
+        } else if self.row_detail.is_some() {
+            Overlay::RowDetail
+        } else {
+            Overlay::None
+        }
+    }
+
+    fn open_row_detail(&mut self) {
+        if !self.data_row_indices().contains(&self.grid_row) {
+            return;
+        }
+        self.row_detail = Some(self.grid_row);
+        self.row_detail_scroll = 0;
+        self.row_detail_max = 0;
+        self.row_detail_page = 1;
+    }
+
+    fn close_row_detail(&mut self) {
+        self.row_detail = None;
+        self.row_detail_scroll = 0;
+        self.row_detail_max = 0;
+    }
+
+    fn scroll_row_detail(&mut self, delta: isize) {
+        let current = self.row_detail_scroll as isize;
+        let max = self.row_detail_max as isize;
+        self.row_detail_scroll = current.saturating_add(delta).clamp(0, max) as u16;
+    }
+
+    fn handle_row_detail_key(&mut self, key: KeyEvent) {
+        let page = self.row_detail_page.max(1) as isize;
+        let half = (page / 2).max(1);
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => self.close_row_detail(),
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_row_detail(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_row_detail(1),
+            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_row_detail(-page),
+            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
+                self.scroll_row_detail(page);
+            }
+            KeyCode::Char('u') => self.scroll_row_detail(-half),
+            KeyCode::Char('d') => self.scroll_row_detail(half),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_row_detail(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.scroll_row_detail(isize::MAX / 2),
+            _ => {}
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -617,6 +692,11 @@ impl App {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.quit = true;
             }
+            return;
+        }
+
+        if self.row_detail.is_some() {
+            self.handle_row_detail_key(key);
             return;
         }
 
@@ -677,6 +757,7 @@ impl App {
                 KeyCode::Char('[') => self.next_changed_row(false),
                 KeyCode::Char('}') => self.next_changed_column(true),
                 KeyCode::Char('{') => self.next_changed_column(false),
+                KeyCode::Enter => self.open_row_detail(),
                 _ => {}
             },
             code => match code {
@@ -860,8 +941,17 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_detail(frame, chunks[2], app);
     draw_footer(frame, chunks[3], app);
+    if app.row_detail.is_some() {
+        draw_row_detail(frame, chunks[1].union(chunks[2]), app);
+    }
     if app.help {
         draw_help(frame, area);
+    }
+
+    let overlay = app.overlay();
+    if overlay != app.last_overlay {
+        super::force_repaint_blank_cells(frame);
+        app.last_overlay = overlay;
     }
 }
 
@@ -1101,7 +1191,7 @@ fn draw_grid(frame: &mut Frame, area: Rect, app: &mut App) {
             ))
             .left_aligned(),
         )
-        .title_bottom(Line::from(" s 工作表 · v 列表 · ? 帮助 ").right_aligned());
+        .title_bottom(Line::from(" Enter 整行 · s/S 工作表 · v 列表 · ? 帮助 ").right_aligned());
     frame.render_widget(block, area);
 
     let Some(sheet) = app.sheet() else {
@@ -1388,13 +1478,264 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let keys = match app.view {
-        ViewMode::Grid => {
-            "hjkl 移动   n/N 变化   ]/[ 行   }/{ 列   s/S 表   f/b 整页   d/u 半页   Tab 筛选   v 列表   ? 帮助   q 退出"
+fn draw_row_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(row_index) = app.row_detail else {
+        return;
+    };
+    let data = app.sheet().and_then(|sheet| {
+        let row = sheet.rows.get(row_index)?;
+        Some((
+            sheet.name.clone(),
+            row_position_text(row, sheet),
+            row_detail_lines(sheet, row_index),
+        ))
+    });
+    let Some((sheet_name, position, lines)) = data else {
+        app.row_detail = None;
+        return;
+    };
+
+    let rect = super::overlay_rect(frame, centered_rect(84, 76, area));
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(
+                "整行对比",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {sheet_name} · {position}"),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    let inner = block.inner(rect);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    let total = paragraph.line_count(inner.width);
+    let max = total
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    let scroll = app.row_detail_scroll.min(max);
+    frame.render_widget(paragraph.scroll((scroll, 0)), rect);
+    app.row_detail_scroll = scroll;
+    app.row_detail_max = max;
+    app.row_detail_page = inner.height;
+}
+
+fn row_detail_lines(sheet: &SheetDiff, row_index: usize) -> Vec<Line<'static>> {
+    let Some(row) = sheet.rows.get(row_index) else {
+        return Vec::new();
+    };
+    let changes = row
+        .cells
+        .iter()
+        .filter(|cell| is_visible_change(cell))
+        .count();
+    let change_text = if changes == 0 {
+        " · 本行无变化".to_string()
+    } else {
+        format!(" · 本行 {changes} 处变化")
+    };
+    // 行本身未变、但新增/删除列带来了单元格差异时，不能写“未变”。
+    let (label, color) = if row.status == Status::Unchanged && changes > 0 {
+        ("有变化", Color::Yellow)
+    } else {
+        (status_text(row.status), status_color(row.status))
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{} ", status_marker(row.status)),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{label} · {}", row_position_text(row, sheet)),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(change_text, Style::default().fg(Color::DarkGray)),
+    ])];
+    lines.push(Line::from(""));
+    for (index, column) in sheet.columns.iter().enumerate() {
+        let body = row_detail_cell_lines(row.cells.get(index));
+        if body.is_empty() {
+            continue;
         }
-        ViewMode::List => {
-            "↑↓ 选择   n/N 变化   Enter 定位   f/b 整页   d/u 半页   Tab 筛选   s/S 表   v 网格   ? 帮助   q 退出"
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{}{}",
+                row_detail_column_marker(column.status),
+                column.label
+            ),
+            row_detail_column_style(column.status),
+        )));
+        lines.extend(body);
+    }
+    if lines.len() == 2 {
+        lines.push(Line::from(Span::styled(
+            "本行没有可显示的单元格",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+fn row_detail_cell_lines(cell: Option<&GridCell>) -> Vec<Line<'static>> {
+    let Some(cell) = cell else {
+        return vec![detail_line("", "（无此列）", Color::DarkGray)];
+    };
+    let old_text = cell.old_value.as_ref().map(detail_text).unwrap_or_default();
+    let new_text = cell.new_value.as_ref().map(detail_text).unwrap_or_default();
+    let mut lines = Vec::new();
+    if old_text == new_text {
+        if !old_text.is_empty() {
+            lines.push(detail_line("值：", &old_text, Color::Reset));
+        }
+    } else {
+        match cell.status {
+            Status::Added => lines.push(detail_pair_line("新：", &new_text, Color::Green)),
+            Status::Removed => lines.push(detail_pair_line("旧：", &old_text, Color::Red)),
+            _ => {
+                lines.push(detail_pair_line("旧：", &old_text, Color::Red));
+                lines.push(detail_pair_line("新：", &new_text, Color::Green));
+            }
+        }
+    }
+    if cell.formula_changed {
+        let old_formula = cell.old_formula.as_deref().unwrap_or("");
+        let new_formula = cell.new_formula.as_deref().unwrap_or("");
+        let text = match (old_formula.is_empty(), new_formula.is_empty()) {
+            (true, false) => new_formula.to_string(),
+            (false, true) => old_formula.to_string(),
+            _ => format!("{old_formula} → {new_formula}"),
+        };
+        lines.push(detail_line("公式：", &text, Color::Reset));
+    } else if lines.is_empty()
+        && let Some(formula) = cell.new_formula.as_deref().or(cell.old_formula.as_deref())
+    {
+        lines.push(detail_line("公式：", formula, Color::Reset));
+    }
+    if cell.type_changed {
+        let old_type = cell
+            .old_value
+            .as_ref()
+            .map(CellValue::type_name)
+            .unwrap_or("empty");
+        let new_type = cell
+            .new_value
+            .as_ref()
+            .map(CellValue::type_name)
+            .unwrap_or("empty");
+        lines.push(detail_line(
+            "类型：",
+            &format!("{old_type} → {new_type}"),
+            Color::Yellow,
+        ));
+    }
+    if let Some(note) = &cell.note {
+        lines.push(detail_line("备注：", note, Color::Cyan));
+    }
+    lines
+}
+
+/// 旧值/新值行：标签和值都用状态色，旧红新绿，便于对照。
+fn detail_pair_line(label: &str, text: &str, color: Color) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            label.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if text.is_empty() {
+        spans.push(Span::styled("（空）", Style::default().fg(Color::DarkGray)));
+    } else {
+        spans.push(Span::styled(text.to_string(), Style::default().fg(color)));
+    }
+    Line::from(spans)
+}
+
+fn detail_line(label: &str, text: &str, color: Color) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    if !label.is_empty() {
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if text.is_empty() {
+        spans.push(Span::styled("（空）", Style::default().fg(Color::DarkGray)));
+    } else {
+        spans.push(Span::styled(text.to_string(), Style::default().fg(color)));
+    }
+    Line::from(spans)
+}
+
+fn detail_text(value: &CellValue) -> String {
+    one_line(&value.display()).replace('\t', " ")
+}
+
+fn row_position_text(row: &GridRow, sheet: &SheetDiff) -> String {
+    if sheet.header_row.is_some_and(|header| row.number() < header) {
+        return format!("表前第 {} 行", row.number());
+    }
+    match (row.old_row, row.new_row) {
+        (Some(old), Some(new)) if old == new => format!("第 {new} 行"),
+        (Some(old), Some(new)) => format!("旧 #{old} → 新 #{new}"),
+        (Some(old), None) => format!("旧 #{old}"),
+        (None, Some(new)) => format!("新 #{new}"),
+        (None, None) => "行号未知".to_string(),
+    }
+}
+
+fn row_detail_column_marker(status: Status) -> &'static str {
+    match status {
+        Status::Added => "+",
+        Status::Removed => "-",
+        Status::Moved => "↔",
+        _ => "",
+    }
+}
+
+fn row_detail_column_style(status: Status) -> Style {
+    let color = match status {
+        Status::Added => Color::Green,
+        Status::Removed => Color::Red,
+        Status::Moved => Color::Cyan,
+        _ => Color::White,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(vertical[1])[1]
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let keys = if app.row_detail.is_some() {
+        "焦点：整行对比   ↑↓/jk 滚动   PgUp/PgDn 翻页   d/u 半页   g/G 首尾   q/Esc/Enter 关闭   ? 帮助   Ctrl+C 退出"
+    } else {
+        match app.view {
+            ViewMode::Grid => {
+                "hjkl 移动   Enter 整行   n/N 变化   ]/[ 行   }/{ 列   f/b 整页   d/u 半页   Tab 筛选   q 退出"
+            }
+            ViewMode::List => {
+                "↑↓ 选择   n/N 变化   Enter 定位   f/b 整页   d/u 半页   Tab 筛选   s/S 表   v 网格   ? 帮助   q 退出"
+            }
         }
     };
     let mut lines = vec![Line::from(Span::styled(
@@ -1405,6 +1746,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(Span::styled(
             notice.to_string(),
             Style::default().fg(Color::Yellow),
+        )));
+    } else if app.row_detail.is_some() {
+        lines.push(Line::from(Span::styled(
+            "整行对比：未变单元格只显示一次，变化单元格显示旧值/新值；不含修订标记",
+            Style::default().fg(Color::DarkGray),
         )));
     } else if app.view == ViewMode::List {
         lines.push(Line::from(Span::styled(
@@ -1496,13 +1842,16 @@ fn current_filter_line(app: &App) -> String {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let width = 74.min(area.width);
-    let height = 27.min(area.height);
-    let rect = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
+    let height = 29.min(area.height);
+    let rect = super::overlay_rect(
+        frame,
+        Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        },
+    );
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::from(Span::styled(
@@ -1514,26 +1863,28 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("网格视图", Style::default().fg(Color::Yellow))),
         Line::from("hjkl / 方向键 移动单元格   f/b 或 PgUp/PgDn 整页"),
-        Line::from("d/u 或 Ctrl+d/Ctrl+u 半页   g/G 或 Home/End 首行/末行"),
-        Line::from("n/N 下一个/上一个变化单元格"),
-        Line::from("] / [ 变化行（保持列）   } / { 变化列（保持行）"),
-        Line::from("S 下一个有变化的工作表   s 手动切换   v 列表"),
-        Line::from("Tab / Shift+Tab 切换筛选   1-6 直选   筛选影响列表和快速导航"),
-        Line::from("空值单元格聚焦显示“·”；跳转后短暂反白并自动居中"),
-        Line::from("表头行自动识别，网格从表头下一行开始；表前标题标为“表前”"),
-        Line::from("表头行差异在列表和列头查看   Enter 不跳转表头行"),
+        Line::from("d/u 或 Ctrl+d/Ctrl+u 半页   g/G 或 Home/End 首尾"),
+        Line::from("n/N 变化单元格   Enter 打开整行对比"),
+        Line::from("] / [ 变化行   } / { 变化列   S/s 工作表   v 列表"),
+        Line::from("Tab / Shift+Tab 切换筛选   1-6 直选"),
+        Line::from("空值聚焦显示“·”；跳转后短暂反白并居中"),
+        Line::from("表头行自动识别，网格从表头下一行开始"),
+        Line::from("表头差异在列表和列头查看   Enter 不跳转表头行"),
         Line::from("边框黄色提示上下左右还有被隐藏的行列"),
+        Line::from(""),
+        Line::from(Span::styled("整行对比", Style::default().fg(Color::Yellow))),
+        Line::from("↑↓/jk 滚动   PgUp/PgDn 翻页   d/u 半页   g/G 首尾"),
+        Line::from("未变单元格显示一次；变化显示旧值(红)/新值(绿)"),
+        Line::from("公式变化、类型变化和备注单独标注；不含修订标记"),
+        Line::from("q / Esc / Enter 关闭，回到网格"),
         Line::from(""),
         Line::from(Span::styled("列表视图", Style::default().fg(Color::Yellow))),
         Line::from("↑↓ / n/N 选择差异单元格   Enter 定位到网格"),
         Line::from("f/b 整页   d/u 半页   g/G 首行/末行"),
-        Line::from("Tab / Shift+Tab 切换筛选   1-6 直选   筛选影响列表和快速导航"),
-        Line::from("] / [ 按行推进   } / { 按列推进   S 跨表找变化"),
-        Line::from(""),
+        Line::from("Tab 切换筛选   ]/[ 按行   }/{ 按列   S 跨表找变化"),
         Line::from(Span::styled("说明", Style::default().fg(Color::Yellow))),
-        Line::from("首版比较值、公式和工作表结构，不求值重算。"),
-        Line::from("不比较样式、图表、批注和条件格式；合并单元格只取左上角。"),
-        Line::from(""),
+        Line::from("首版比较值、公式和工作表结构，不求值重算"),
+        Line::from("不比较样式、图表、批注和条件格式；合并单元格取左上角"),
         Line::from(Span::styled(
             "按 ? 或 Esc 关闭",
             Style::default().fg(Color::DarkGray),
@@ -1782,6 +2133,248 @@ mod tests {
             status: Status::Unchanged,
             cells: statuses.iter().copied().map(test_cell).collect(),
         }
+    }
+
+    fn value_cell(status: Status, old: Option<&str>, new: Option<&str>) -> GridCell {
+        let mut cell = test_cell(status);
+        cell.old_value = old.map(|text| CellValue::Text(text.to_string()));
+        cell.new_value = new.map(|text| CellValue::Text(text.to_string()));
+        cell.value_changed = old != new;
+        cell
+    }
+
+    fn detail_sheet() -> SheetDiff {
+        let columns = vec![
+            ColumnInfo {
+                label: "名称".to_string(),
+                old_col: Some(1),
+                new_col: Some(1),
+                status: Status::Unchanged,
+            },
+            ColumnInfo {
+                label: "数量".to_string(),
+                old_col: Some(2),
+                new_col: Some(2),
+                status: Status::Unchanged,
+            },
+            ColumnInfo {
+                label: "新增列".to_string(),
+                old_col: None,
+                new_col: Some(3),
+                status: Status::Added,
+            },
+            ColumnInfo {
+                label: "删除列".to_string(),
+                old_col: Some(4),
+                new_col: None,
+                status: Status::Removed,
+            },
+            ColumnInfo {
+                label: "空列".to_string(),
+                old_col: Some(5),
+                new_col: Some(5),
+                status: Status::Unchanged,
+            },
+        ];
+        SheetDiff {
+            name: "指标".to_string(),
+            status: Status::Modified,
+            header_row: Some(1),
+            columns,
+            rows: vec![
+                test_row(1, &[Status::Unchanged; 5]),
+                GridRow {
+                    old_row: Some(2),
+                    new_row: Some(2),
+                    status: Status::Modified,
+                    cells: vec![
+                        value_cell(Status::Unchanged, Some("售电量"), Some("售电量")),
+                        value_cell(Status::Modified, Some("100"), Some("120")),
+                        value_cell(Status::Added, None, Some("备注 A")),
+                        value_cell(Status::Removed, Some("旧备注"), None),
+                        test_cell(Status::Unchanged),
+                    ],
+                },
+            ],
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn row_detail_shows_unchanged_once_and_old_new_for_changes() {
+        let sheet = detail_sheet();
+        let lines = row_detail_lines(&sheet, 1);
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("修改 · 第 2 行"), "{text}");
+        assert_eq!(
+            text.matches("售电量").count(),
+            1,
+            "未变单元格只显示一次: {text}"
+        );
+        assert!(text.contains("旧：100"), "{text}");
+        assert!(text.contains("新：120"), "{text}");
+        assert!(text.contains("新：备注 A"), "{text}");
+        assert!(!text.contains("旧：备注 A"), "{text}");
+        assert!(text.contains("旧：旧备注"), "{text}");
+        assert!(!text.contains("新：旧备注"), "{text}");
+        assert!(!text.contains("空列"), "未变空单元格不占篇幅: {text}");
+        let span_style = |needle: &str| -> Style {
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.as_ref() == needle)
+                .unwrap_or_else(|| panic!("找不到 {needle}: {text}"))
+                .style
+        };
+        for (label, color) in [("旧：", Color::Red), ("新：", Color::Green)] {
+            let style = span_style(label);
+            assert!(
+                style.add_modifier.contains(Modifier::BOLD),
+                "{label} 应加粗"
+            );
+            assert_eq!(style.fg, Some(color), "{label} 颜色");
+        }
+        assert_eq!(span_style("100").fg, Some(Color::Red), "旧值应红色");
+        assert_eq!(span_style("120").fg, Some(Color::Green), "新值应绿色");
+        assert!(
+            lines.iter().flat_map(|line| &line.spans).all(|span| !span
+                .style
+                .add_modifier
+                .intersects(Modifier::CROSSED_OUT | Modifier::UNDERLINED)),
+            "整行对比不显示修订标记: {text}"
+        );
+    }
+
+    #[test]
+    fn row_detail_does_not_claim_unchanged_when_only_columns_changed() {
+        let mut sheet = detail_sheet();
+        sheet.rows[1].status = Status::Unchanged;
+        let text = row_detail_lines(&sheet, 1)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(text.contains("有变化 · 第 2 行"), "{text}");
+        assert!(!text.contains("未变 · 第 2 行"), "{text}");
+        assert!(text.contains("+新增列"), "{text}");
+        assert!(text.contains("-删除列"), "{text}");
+    }
+
+    #[test]
+    fn row_detail_lists_formula_and_type_changes() {
+        let mut sheet = detail_sheet();
+        let cell = &mut sheet.rows[1].cells[1];
+        cell.old_value = Some(CellValue::Integer(100));
+        cell.new_value = Some(CellValue::Float(120.0));
+        cell.old_formula = Some("=B2".to_string());
+        cell.new_formula = Some("=B2*1.2".to_string());
+        cell.formula_changed = true;
+        cell.type_changed = true;
+        let text = row_detail_lines(&sheet, 1)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("公式：=B2 → =B2*1.2"), "{text}");
+        assert!(text.contains("类型：integer → float"), "{text}");
+    }
+
+    #[test]
+    fn row_detail_opens_from_grid_and_closes_without_quitting() {
+        let mut app = navigation_app();
+        let press = |app: &mut App, code| {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.row_detail, Some(1));
+
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.row_detail, None);
+        assert!(!app.quit, "整行对比里的 q 不应退出程序");
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.row_detail, None);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.row_detail, None, "Enter 也应关闭整行对比");
+
+        let mut empty = test_app(vec![test_sheet(
+            "S",
+            Some(1),
+            vec![test_row(1, &[Status::Unchanged, Status::Unchanged])],
+        )]);
+        empty.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(empty.row_detail, None, "没有数据行时不应打开整行对比");
+
+        app.toggle_view();
+        assert_eq!(app.view, ViewMode::List);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.row_detail, None, "列表里的 Enter 仍是定位");
+        assert_eq!(app.view, ViewMode::Grid);
+    }
+
+    #[test]
+    fn row_detail_scroll_keys_clamp_to_content() {
+        let mut app = navigation_app();
+        let press = |app: &mut App, code| {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        press(&mut app, KeyCode::Enter);
+        app.row_detail_page = 5;
+        app.row_detail_max = 20;
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.row_detail_scroll, 1);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.row_detail_scroll, 6);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.row_detail_scroll, 20);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.row_detail_scroll, 20);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.row_detail_scroll, 0);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.row_detail_scroll, 0);
+
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help);
+        assert_eq!(app.row_detail, Some(1), "帮助关闭前不应丢掉整行对比");
+    }
+
+    #[test]
+    fn row_detail_draws_overlay_and_remembers_scroll_page() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(vec![detail_sheet()]);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                screen.push_str(buffer[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        let compact: String = screen.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("整行对比"), "{screen}");
+        assert!(compact.contains("旧：100"), "{screen}");
+        assert!(app.row_detail_page > 0);
+        assert_eq!(app.last_overlay, Overlay::RowDetail);
     }
 
     fn test_sheet(name: &str, header_row: Option<usize>, rows: Vec<GridRow>) -> SheetDiff {

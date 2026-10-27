@@ -1644,7 +1644,7 @@ fn draw_table_detail(frame: &mut Frame, area: Rect, app: &mut App, row_index: us
         app.table_detail = None;
         return;
     }
-    let rect = centered_rect(84, 76, area);
+    let rect = overlay_rect(frame, centered_rect(84, 76, area));
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3065,7 +3065,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let rect = centered_rect(76, 86, area);
+    let rect = overlay_rect(frame, centered_rect(76, 86, area));
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::from(Span::styled(
@@ -3123,7 +3123,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 }
 
 fn draw_dialog(frame: &mut Frame, area: Rect, dialog: &ExportDialog) {
-    let rect = centered_rect(66, 36, area);
+    let rect = overlay_rect(frame, centered_rect(66, 36, area));
     frame.render_widget(Clear, rect);
     match dialog {
         ExportDialog::Choice { selected } => {
@@ -3225,6 +3225,36 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(vertical[1])[1]
+}
+
+/// 调整浮层左边界，避免正好切在宽字符中间。
+///
+/// 左边界左边一列若是宽字符的第二列，渲染器会把它当成宽字符的隐藏列跳过，
+/// 浮层左边框就不会被下发，终端上看着像缺了一条边。先整体右移 1-2 列找安全边；
+/// 找不到（内容非常密）再把邻居宽字符清成空格，保证边框完整。
+fn overlay_rect(frame: &mut Frame, rect: Rect) -> Rect {
+    let limit = frame.area().right();
+    let buffer = frame.buffer_mut();
+    for shift in 0..=2u16 {
+        let left = rect.x + shift;
+        if left + rect.width > limit {
+            break;
+        }
+        if left == 0 {
+            return Rect { x: left, ..rect };
+        }
+        let blocked = (rect.top()..rect.bottom())
+            .any(|y| UnicodeWidthStr::width(buffer[(left - 1, y)].symbol()) > 1);
+        if !blocked {
+            return Rect { x: left, ..rect };
+        }
+    }
+    for y in rect.top()..rect.bottom() {
+        if rect.x > 0 && UnicodeWidthStr::width(buffer[(rect.x - 1, y)].symbol()) > 1 {
+            buffer[(rect.x - 1, y)].reset();
+        }
+    }
+    rect
 }
 
 fn file_label(path: &Path) -> String {
