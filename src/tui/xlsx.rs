@@ -1513,18 +1513,40 @@ fn draw_row_detail(frame: &mut Frame, area: Rect, app: &mut App) {
             ),
         ]));
     let inner = block.inner(rect);
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let total = paragraph.line_count(inner.width);
     let max = total
         .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
     let scroll = app.row_detail_scroll.min(max);
-    frame.render_widget(paragraph.scroll((scroll, 0)), rect);
+    let hint = row_detail_scroll_hint(scroll, max);
+    let block = if hint.is_empty() {
+        block
+    } else {
+        block.title_bottom(
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))).right_aligned(),
+        )
+    };
+    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), rect);
     app.row_detail_scroll = scroll;
     app.row_detail_max = max;
     app.row_detail_page = inner.height;
+}
+
+/// 内容超出浮层时在右下角提示还能往哪边滚。
+fn row_detail_scroll_hint(scroll: u16, max: u16) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let below = max.saturating_sub(scroll);
+    let mut parts = Vec::new();
+    if scroll > 0 {
+        parts.push(format!("↑ 上方还有 {scroll} 行"));
+    }
+    if below > 0 {
+        parts.push(format!("↓ 下方还有 {below} 行"));
+    }
+    format!(" {} ", parts.join(" · "))
 }
 
 fn row_detail_lines(sheet: &SheetDiff, row_index: usize) -> Vec<Line<'static>> {
@@ -1561,9 +1583,6 @@ fn row_detail_lines(sheet: &SheetDiff, row_index: usize) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     for (index, column) in sheet.columns.iter().enumerate() {
         let body = row_detail_cell_lines(row.cells.get(index));
-        if body.is_empty() {
-            continue;
-        }
         lines.push(Line::from(Span::styled(
             format!(
                 "{}{}",
@@ -1591,9 +1610,7 @@ fn row_detail_cell_lines(cell: Option<&GridCell>) -> Vec<Line<'static>> {
     let new_text = cell.new_value.as_ref().map(detail_text).unwrap_or_default();
     let mut lines = Vec::new();
     if old_text == new_text {
-        if !old_text.is_empty() {
-            lines.push(detail_line("值：", &old_text, Color::Reset));
-        }
+        lines.push(detail_line("值：", &old_text, Color::Reset));
     } else {
         match cell.status {
             Status::Added => lines.push(detail_pair_line("新：", &new_text, Color::Green)),
@@ -1749,7 +1766,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         )));
     } else if app.row_detail.is_some() {
         lines.push(Line::from(Span::styled(
-            "整行对比：未变单元格只显示一次，变化单元格显示旧值/新值；不含修订标记",
+            "整行对比：未变单元格只显示一次，空值标（空），变化单元格显示旧值/新值；不含修订标记",
             Style::default().fg(Color::DarkGray),
         )));
     } else if app.view == ViewMode::List {
@@ -1874,7 +1891,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("整行对比", Style::default().fg(Color::Yellow))),
         Line::from("↑↓/jk 滚动   PgUp/PgDn 翻页   d/u 半页   g/G 首尾"),
-        Line::from("未变单元格显示一次；变化显示旧值(红)/新值(绿)"),
+        Line::from("未变单元格显示一次，空值标（空）；变化显示旧值(红)/新值(绿)"),
         Line::from("公式变化、类型变化和备注单独标注；不含修订标记"),
         Line::from("q / Esc / Enter 关闭，回到网格"),
         Line::from(""),
@@ -2223,7 +2240,11 @@ mod tests {
         assert!(!text.contains("旧：备注 A"), "{text}");
         assert!(text.contains("旧：旧备注"), "{text}");
         assert!(!text.contains("新：旧备注"), "{text}");
-        assert!(!text.contains("空列"), "未变空单元格不占篇幅: {text}");
+        assert!(text.contains("空列"), "空值列也要列出: {text}");
+        assert!(text.contains("值：（空）"), "空值应标注（空）: {text}");
+        for label in ["名称", "数量", "新增列", "删除列", "空列"] {
+            assert!(text.contains(label), "缺少列 {label}: {text}");
+        }
         let span_style = |needle: &str| -> Style {
             lines
                 .iter()
@@ -2248,6 +2269,17 @@ mod tests {
                 .add_modifier
                 .intersects(Modifier::CROSSED_OUT | Modifier::UNDERLINED)),
             "整行对比不显示修订标记: {text}"
+        );
+    }
+
+    #[test]
+    fn row_detail_scroll_hint_points_to_hidden_content() {
+        assert_eq!(row_detail_scroll_hint(0, 0), "");
+        assert_eq!(row_detail_scroll_hint(0, 6), " ↓ 下方还有 6 行 ");
+        assert_eq!(row_detail_scroll_hint(6, 6), " ↑ 上方还有 6 行 ");
+        assert_eq!(
+            row_detail_scroll_hint(2, 5),
+            " ↑ 上方还有 2 行 · ↓ 下方还有 3 行 "
         );
     }
 
